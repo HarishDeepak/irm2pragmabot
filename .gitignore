@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+
+# Environment / secrets
+.env
+.env.*
+*.key
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS generated
+.DS_Store
+Thumbs.db
+
+# Images (allow docs/ images for README)
+*.png
+*.jpg
+*.JPG
+!docs/*
+
+# Model weights
+*.pth
+*.pt
+*.tar
+
+# Large media files
+*.mp4
+*.tiff
+*.avi
+*.flv
+*.mov
+*.wmv
+
+# Logs and data (keep directory structure via .gitkeep)
+pragmabot/data/logs/*
+!pragmabot/data/logs/.gitkeep
+
+pragmabot/data/ltm/*
+!pragmabot/data/ltm/ltm.csv
+
+# Scripts output (keep directory structure via .gitkeep)
+scripts/output/*
+!scripts/output/.gitkeep
+
+# Log files
+*.log
