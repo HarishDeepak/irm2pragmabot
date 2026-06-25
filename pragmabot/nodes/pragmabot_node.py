@@ -25,6 +25,7 @@ from pragmabot.vlm_exp_summarizer import VLMExperienceSummarizer
 from pragmabot.conversation_builder import ConversationBuilder
 from pragmabot.vlm_scene_describer import VLMSceneDescriber
 from pragmabot.memory_manager import MemoryManager
+from pragmabot.panda_skill_executor import PandaSkillExecutor
 
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,7 @@ class PragmaBot:
         self.exp_summarizer = VLMExperienceSummarizer(self.vlm_client, self.conversation_log)
         self.success_detector = VLMSuccessDetector(self.vlm_client, self.conversation_log)
         self.task_planner = VLMTaskPlanner(self.vlm_client, self.conversation_log)
+        self.executor = PandaSkillExecutor()
 
         self.start_gradio_interface()
 
@@ -130,9 +132,10 @@ class PragmaBot:
             # Send a request for success detection if no action execution
             self.handle_evaluation_request(chatbot)
         else:
-            raise NotImplementedError(
-                "Implement your own action execution logic here, and then call the success detection service after executing the action in the real world."
-            )
+            exec_result = self.executor.execute(next_action)
+            if not exec_result.get("success", False):
+                rospy.logwarn("Skill execution failed: %s", exec_result.get("message", ""))
+            self.handle_evaluation_request(chatbot)
 
     def handle_evaluation_request(self, chatbot):
         """Evaluate action success by comparing before/after observations.
@@ -170,13 +173,8 @@ class PragmaBot:
                 info_msg = "The human operator might have reset the scene after the action failure."
                 self.append_to_stm_if_activated("additional_info", info_msg)
 
-            # if using rosbag, call planning directly
-            if self.config.rosbag_replay:
-                self.handle_planning_request(chatbot)
-            else:
-                raise NotImplementedError(
-                    "Implement your own logic here to decide when to call the planning function again for re-planning, based on the success evaluation results."
-                )
+            # loop back to planning
+            self.handle_planning_request(chatbot)
 
     def handle_experience_summarization(self, chatbot):
         """Summarize the current short-term memory into a long-term experience entry.
