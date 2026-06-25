@@ -1,0 +1,11 @@
+# Goal
+string target_object
+bool use_annotation
+---
+# Result
+bool success
+string message
+geometry_msgs/PoseStamped grasp_pose
+---
+# Feedback
+string status

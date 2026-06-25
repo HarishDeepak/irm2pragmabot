@@ -1,0 +1,10 @@
+# Goal
+string target_object
+string goal_region
+---
+# Result
+bool success
+string message
+---
+# Feedback
+string status

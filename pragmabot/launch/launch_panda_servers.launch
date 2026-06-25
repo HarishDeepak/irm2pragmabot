@@ -1,0 +1,5 @@
+<launch>
+  <node name="panda_pick_server"  pkg="pragmabot" type="panda_pick_server.py"  output="screen"/>
+  <node name="panda_place_server" pkg="pragmabot" type="panda_place_server.py" output="screen"/>
+  <node name="panda_push_server"  pkg="pragmabot" type="panda_push_server.py"  output="screen"/>
+</launch>
