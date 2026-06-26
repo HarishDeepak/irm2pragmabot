@@ -153,16 +153,37 @@ python3 -c "from pragmabot.msg import PandaPickAction, PandaPlaceAction, PandaPu
 
 ---
 
-## Step 7 — Set OpenAI API Key
+## Step 7 — Set API Key
 
+PragmaBot now supports three VLM backends. Set the key for whichever you use:
+
+**OpenAI (GPT-4o):**
 ```bash
 export OPENAI_API_KEY="sk-..."
 ```
 
-Add to `~/.bashrc` to persist across sessions:
-
+**Anthropic (Claude):** *(recommended — supervisor-provided)*
 ```bash
-echo 'export OPENAI_API_KEY="sk-..."' >> ~/.bashrc
+export ANTHROPIC_API_KEY="sk-ant-..."
+pip install anthropic sentence-transformers
+```
+
+> Claude has no embeddings API, so embeddings fall back to `sentence-transformers` running locally (`all-MiniLM-L6-v2`). The first call downloads ~90 MB of model weights automatically.
+
+**Google Gemini:**
+```bash
+export GOOGLE_API_KEY="..."
+pip install google-generativeai
+```
+
+Select the backend in `config.yaml` under `vlm.vlm_model`:
+- OpenAI: `gpt-4o-2024-08-06`
+- Claude: `claude-opus-4-8`
+- Gemini: `gemini-2.5-pro`
+
+Add the relevant key to `~/.bashrc` to persist across sessions:
+```bash
+echo 'export ANTHROPIC_API_KEY="sk-ant-..."' >> ~/.bashrc
 ```
 
 ---

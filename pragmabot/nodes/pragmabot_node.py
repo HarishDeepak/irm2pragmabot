@@ -66,14 +66,22 @@ class PragmaBot:
         self.config = get_config()
         self.scene_observer = SceneObserver(self.config.topics)
 
-        # If vlm model contains gpt, initialize the client
+        # Select VLM client based on model name prefix
         if "gpt" in self.config.vlm.vlm_model:
             self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
             rospy.loginfo(f"Using {self.config.vlm.vlm_model} with OpenAI")
+            self.vlm_client = VLMClient(self.client, self.config.vlm)
+        elif "claude" in self.config.vlm.vlm_model:
+            from pragmabot.claude_vlm_client import ClaudeVLMClient
+            rospy.loginfo(f"Using {self.config.vlm.vlm_model} with Anthropic")
+            self.vlm_client = ClaudeVLMClient(self.config.vlm)
+        elif "gemini" in self.config.vlm.vlm_model:
+            from pragmabot.gemini_vlm_client import GeminiVLMClient
+            rospy.loginfo(f"Using {self.config.vlm.vlm_model} with Google Gemini")
+            self.vlm_client = GeminiVLMClient(self.config.vlm)
         else:
             rospy.logfatal("Unsupported VLM model: %s", self.config.vlm.vlm_model)
             sys.exit(1)
-        self.vlm_client = VLMClient(self.client, self.config.vlm)
 
         self.memory_manager = MemoryManager(self.vlm_client, self.conversation_log)
         self.scene_describer = VLMSceneDescriber(self.vlm_client, self.conversation_log)

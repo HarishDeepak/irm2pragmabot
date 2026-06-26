@@ -9,8 +9,13 @@ use_random_retrieval: false
 retrieval_top_k: 5  # -1 for everything (unsorted)
 
 # --- VLM API ---
+# OpenAI:   vlm_model: gpt-4o-2024-08-06   (needs OPENAI_API_KEY)
+# Anthropic: vlm_model: claude-opus-4-8     (needs ANTHROPIC_API_KEY)
+# Gemini:   vlm_model: gemini-2.5-pro       (needs GOOGLE_API_KEY)
 vlm:
-  vlm_model: gpt-4o-2024-08-06
+  vlm_model: claude-opus-4-8
+  # text_embedding_model is only used with OpenAI. Claude uses sentence-transformers
+  # (all-MiniLM-L6-v2 locally). Gemini uses models/text-embedding-004 natively.
   text_embedding_model: text-embedding-3-large
 
 # --- ROS Topics ---
