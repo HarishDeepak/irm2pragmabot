@@ -62,7 +62,7 @@ python3 -c "import ros_numpy; print('ros_numpy ok')"
 
 ```bash
 cd /catkin_ws
-catkin build pragmabot
+catkin_make --pkg pragmabot
 source devel/setup.bash
 ```
 
@@ -294,6 +294,36 @@ chmod +x /catkin_ws/src/pragmabot/pragmabot/nodes/panda_pick_server.py
 chmod +x /catkin_ws/src/pragmabot/pragmabot/nodes/panda_place_server.py
 chmod +x /catkin_ws/src/pragmabot/pragmabot/nodes/panda_push_server.py
 ```
+The launch file
+
+<launch>
+  <node name="panda_pick_server" pkg="pragmabot" type="panda_pick_server.py" output="screen"/>
+  ...
+</launch>
+
+This is a ROS launch file. It starts all three action server nodes in one command instead of you having to open 3 terminals and run each script manually. When you run:
+roslaunch pragmabot launch_panda_servers.launch
+ROS reads this file and spawns all three nodes at once.
+
+---
+chmod +x
+
+ROS needs to execute these Python files directly (like a program, not python3 file.py). chmod +x marks them as executable so the OS allows that. Withouh a "permission denied" error.
+
+---                                                                                                           Why CMakeLists.txt is updated
+
+catkin_install_python(PROGRAMS ...) tells catkin which Python scripts are ROS nodes. If a script isn't listed there, roslaunch won't find it via the type= attribute. That's why the three server files were added to that  list.
+                                                                                                              The add_action_files + generate_messagesenerate Python/C++ message classes fromyour .action files. That's what produces pragmabot.msg.PandaPickAction etc. — without those lines, the import would fail.
+
+---
+Why package.xml is updated
+
+package.xml is the dependency declaration for the ROS build system. It lists what your package needs to build and run. Adding actionlib, actionlib_msgs, geometry_msgs, message_generation, message_runtime there tells:
+- other developers what to install
+- rosdep what to auto-install
+- catkin what to link against
+
+Short version: CMakeLists.txt = how to build. package.xml = what is needed to build.
 
 ### 2.10 Build and verify action messages generated
 
@@ -401,6 +431,31 @@ Open the Gradio URL, submit an instruction like `"put the apple on the plate"`.
 - No crashes or unexpected errors
 
 ---
+Good — rosbag_replay is already true. Here's what we tested and what it means:
+
+---
+What we just verified
+
+Import test — PandaSkillExecutor, ObjectDetector, GraspEstimator all import cleanly. No missing modules.
+
+Instantiation test — PandaSkillExecutor() creates without error. No ROS master needed for construction.
+
+Execute test — Called executor.execute() with a fake PICK action and dummy images. It ran _pick() (which logs STUB _pick: would pick 'apple') then _return_to_observation_pose() — no crash.
+
+---
+- real OpenAI API key → VLM actually planning actions
+- Gradio UI → submit an instruction, watch the loop run
+- STM entries appearing in logs
+- LTM CSV written after task completion
+
+That part we can't run right now because it needs a rosbag file and an OpenAI API key set. But the code path is:
+
+rosbag_replay: true
+→ handle_planning_request() calls VLM planner
+→ executor.execute() logs STUB (no robot moves)
+→ handle_evaluation_request() calls success detector on rosbag images
+→ STM updated → loop continues
+
 
 ## Phase 4 — GroundedSAM Installation and Offline Test
 
