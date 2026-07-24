@@ -54,3 +54,11 @@ scripts/output/*
 
 # Log files
 *.log
+
+# FR3 host-adaptation workspace: rosbags, extracted frames, model checkpoints
+bags/*
+!bags/.gitkeep
+extracted/*
+!extracted/.gitkeep
+weights/*
+!weights/.gitkeep

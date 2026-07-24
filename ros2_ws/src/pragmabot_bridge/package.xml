@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>pragmabot_bridge</name>
+  <version>0.1.0</version>
+  <description>Action-client bridge: routes PragmaBot planner skill decisions to Container 1's live MoveIt2/gripper interfaces.</description>
+  <maintainer email="harish.deepak@example.com">Harish Deepak</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>moveit_msgs</depend>
+  <depend>franka_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>pragmabot_interfaces</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
