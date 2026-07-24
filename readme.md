@@ -125,3 +125,25 @@ The point cloud is smeared because of stereo-depth "flying pixel" noise at the m
 - This is a well-known artifact of stereo depth cameras (ZED included): at any depth discontinuity — an object edge against the background — the stereo matcher can't cleanly resolve which surface a boundary pixel belongs to, so it interpolates between the near and far depth, producing a comet-tail of noisy points trailing off the true object edge. The 2D mask itself is accurate (that's a GroundedSAM/SAM2 problem, not present here); it's the depth values at those same pixel locations
 
 Fix: erode the mask by a few pixels before back-projecting (drops exactly the boundary ring where this noise lives), and/or add an outlier filter (e.g. keep only points within N·std of the median z). Want me to add a --erode-px and/or a z-outlier filter to mask_to_pointcloud.py and regenerate the point cloud/grasps?
+
+
+
+
+❯ do we have space to install it for ourself
+
+  Listed 1 directory, ran 2 shell commands
+
+Yes, barely — but there's a much better option I just found. Let me lay out the numbers.
+
+Host venv/conda route: We have 30GB free (97% full, 938GB disk). A native FoundationPose env (PyTorch3D + nvdiffrast built from source, like jiayun/rickmer have) runs 5–11GB based on comparable CUDA/torch envs already on this machine (rickmer's envs range 4.5–11GB, jiayun's 3.6–6.4GB). It would fit, but on a disk that already hit 100% once this session, that's cutting it close and leaves almost no margin.
+
+Docker route — much better: docker images shows this machine already has three pre-pulled FoundationPose images, including the official wenbowen123/foundationpose:latest (20.2GB) — sitting there at zero additional disk cost since they're already downloaded. Docker images are shared across all users on the host, not per-home-directory.
+
+This directly conflicts with the CLAUDE.md note "Do NOT reuse the old foundationpose Docker container — abandoned along with the rest of the container plan." That note was about not resurrecting a specific dead, exited container (Exited (255)) — but the underlying image is still here and pullable into a fresh container, which is a different thing. Given the disk situation, I think this is worth revisiting rather than blindly following the old decision.
+
+● User declined to answer questions
+· Given disk is at 97% (30GB free) and this machine already has the official wenbowen123/foundationpose:latest image pulled (20.2GB, zero marginal cost to use), how do you want to set up FoundationPose? (Use the existing Docker image (Recommended) / Install natively on host anyway / Just check the numbers, decide later)
+
+What would you like to clarify?
+
+✻ Churned for 49s
