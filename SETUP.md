@@ -382,3 +382,57 @@ python3 /catkin_ws/src/pragmabot/scripts/test_grounded_sam.py \
 | 5 | GraspGen ZMQ client | ✅ Done |
 | 6 | Full action server implementations | ✅ Done |
 | 7 | Physical robot validation | ⏳ Needs lab |
+
+---
+
+## Reproducing the ZED2/FR3 extrinsic calibration environment (2026-07-27)
+
+Everything needed to bring this exact setup back up on the lab machine (`Alonnisos`) after time away. All commands assume this host, not a fresh machine — paths below are absolute for that reason.
+
+**Required running pieces, in order:**
+
+1. **`export ROS_DOMAIN_ID=7`** in every terminal that touches ZED or FR3 topics — the ZED wrapper and franka containers both publish/subscribe on domain 7, not the ROS2 default (domain 0). Forgetting this is the single most common "nothing shows up" symptom.
+
+2. **ZED2 camera** (host, not a container):
+   ```
+   source /opt/ros/humble/setup.bash
+   source ~/zed_ros2_ws/install/setup.bash
+   ros2 launch zed_wrapper zed_camera.launch.py \
+       camera_model:=zed2 \
+       param_overrides:="general.grab_resolution:=HD1080"
+   ```
+   `depth_mode` and `pos_tracking_enabled` are NOT top-level launch args in this wrapper version — they're `param_overrides` dotted keys (`depth.depth_mode`, `pos_tracking.pos_tracking_enabled`) and both already default correctly on the `local-fr3-setup` branch (`NEURAL_PLUS`, `false`) — no override needed for those two. Confirmed topic namespace is `/zed/zed_node/...` (not `/zedxm` — that only appears in this repo's stale `config.yaml`).
+
+3. **FR3 robot + MoveIt** (inside the `franka_ros2_humble` docker container, host networking, already has `ROS_DOMAIN_ID=7` baked in):
+   ```
+   docker start franka_ros2_humble   # if not already running
+   docker exec -it -e DISPLAY=$DISPLAY franka_ros2_humble bash
+   source /opt/ros/humble/setup.bash && source /ros2_ws/install/setup.bash
+   ros2 launch franka_fr3_moveit_config moveit.launch.py robot_ip:=10.10.10.10
+   ```
+   **Check first whether this is already running** (`ps aux | grep move_group` inside the container) before launching again — a second `moveit.launch.py` instance starts its own `robot_state_publisher`/`move_group`/`ros2_control_node` that conflicts with an existing one (its controller spawners fail since the real hardware connection is already held), and having two `robot_state_publisher`s publish the same `fr3_link*` TF frames makes the robot model render with stale/wrong joint values in RViz ("floating" robot, disconnected from the real point cloud). If one's already up, just attach a plain `rviz2 -d /ros2_ws/install/franka_fr3_moveit_config/share/franka_fr3_moveit_config/rviz/moveit.rviz` instead of relaunching the whole thing.
+
+4. **FoundationPose container** (GPU-bound, RTX 4080 needs CUDA 11.8+/sm_89 — the other two pulled images are stuck on CUDA 11.3 and won't compile):
+   ```
+   docker start foundationpose_calib
+   ```
+   Sanity check mesh units before any real run:
+   ```
+   docker exec foundationpose_calib /opt/conda/envs/my/bin/python -c \
+       "import trimesh; print(trimesh.load('/workspace/FoundationPose/calib_io/cube.obj').bounding_box.extents)"
+   ```
+   should print `[0.061 0.061 0.061]` (meters, not mm).
+
+5. **Run the calibration** (host, `~/pragmabot/calibration/`):
+   ```
+   python3 calibrate_extrinsic.py --mesh ~/foundationpose/FoundationPose/calib_io/cube.obj \
+       --num-frames 8 --camera-topic-ns /zed/zed_node \
+       --cube-xyz-in-base X Y Z --cube-rpy-in-base R P Y
+   ```
+   Omit `--cube-xyz-in-base`/`--cube-rpy-in-base` entirely to run just the vision capture (saves `T_cube_in_camera` to `--out-cube-pose` without publishing TF) if the hand measurement isn't ready yet — avoids re-running the expensive GPU step later.
+
+**Gotchas already hit once, don't re-debug them:**
+- `register_once.py` OOMs a 16GB GPU at full 1920x1080 input — it now downscales to `--max-side 960` by default (rescales K to match) before calling `register()`.
+- Don't publish the external calibration TF directly to `zed_left_camera_frame_optical` — that frame already has a parent inside the ZED wrapper's own internal static TF tree (`zed_camera_link -> ... -> zed_left_camera_frame_optical`). Attach to `zed_camera_link` instead (the actual root of the ZED's tree), composing out the fixed offset via `tf2_echo zed_camera_link zed_left_camera_frame_optical`.
+- If re-taping the calibration cube, match `mesh_gen.py`'s `--stripe-frac` exactly (currently `0.3` → ~1.8cm on the 6.1cm cube) — a mismatch between the physical tape and the modeled mesh stripe biases FoundationPose's rendered-vs-real pose scoring.
+- System `franka_description` (`/opt/ros/humble/share/franka_description`) is missing its `.dae`/`.stl` mesh files on the host (only the container's own install has them) — RobotModel display in a host-launched RViz will show load errors; use the container's own `rviz2` (has working meshes) instead of a host one for anything showing the robot mesh.
