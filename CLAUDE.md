@@ -79,12 +79,15 @@ the entire bug class, not just the symptom.
   e-stop button (conf 0.48); `--select best` (default) keeps only the
   top-confidence match in `mask.npy`, `--select all` unions everything
   above threshold.
-- **FoundationPose:** `~/foundationpose` — folder exists, not yet set up.
-  Env should be `uv venv --python 3.9 .venv` (verified directly against
-  the NVlabs/FoundationPose repo: python3.9 conda pin, compiled `.so`
-  naming `cpython-39`, PyTorch3D wheel tags — this is correct, not a
-  guess). Do NOT reuse the old `foundationpose` Docker container
-  (`Exited (255)`) — abandoned along with the rest of the container plan.
+- **FoundationPose:** `~/foundationpose/FoundationPose` — repo already
+  cloned (2026-07-24), clean, on `main`. `.venv` at `~/foundationpose/.venv`
+  already created with **python 3.11** (confirmed 2026-07-25, matches
+  live `environment.yml`) but has no packages installed yet — env, not
+  weights, is the next step. A `.venv_py39_unused` sits alongside it from
+  an earlier, wrong python-3.9 attempt — do not use it, safe to delete.
+  No `weights/` folder yet — model weights not downloaded. Do NOT reuse
+  the old `foundationpose` Docker container (`Exited (255)`) — abandoned
+  along with the rest of the container plan.
 - **pragmabot bridge/planner:** `~/pragmabot` (this repo).
 - **VS Code workspace:** `~/irm2.code-workspace` — multi-root, one
   terminal profile per environment above, opened via

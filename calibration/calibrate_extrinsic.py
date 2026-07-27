@@ -26,26 +26,39 @@ cube with faces aligned to the base axes (recommended — makes measurement
 and error-checking much easier), rpy is likely close to [0,0,0] or a
 multiple of pi/2.
 
-FLAGGED, NOT VERIFIED: the exact FoundationPose class/method signature
-below (see `run_foundationpose_register`) is written generically based on
-the demo script's register()/track() naming convention, but the precise
-API (constructor args, K-matrix format, mask requirements) was not
-confirmed against the actual repo in this conversation. Check
-`repo_reference` or FoundationPose's own run_demo.py once you have it
-cloned tomorrow, and adjust that one function accordingly — everything
-else in this script (averaging, extrinsic composition, IMU check, TF
-publish) is not dependent on that API and is safe to trust as-is.
+FoundationPose runs in the `foundationpose_calib` Docker container (CUDA
+11.8 image — verified 2026-07-25 the RTX 4080 needs 11.8+ for compute_89;
+the two other pulled images are stuck on CUDA 11.3 and will not compile),
+never natively on host. `run_foundationpose_register()` below talks to it
+purely over files — writes rgb/depth/K/mask into the container's mounted
+calib_io/ dir, runs register_once.py via `docker exec`, reads the pose
+back. No ROS2/DDS ever crosses the container boundary (that's the exact
+bug class that cost a full day before — see CLAUDE.md).
 """
 
 import argparse
+import json
+import subprocess
+import tempfile
+import time
+from pathlib import Path
 
+import cv2
+import message_filters
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from scipy.spatial.transform import Rotation as R
-from sensor_msgs.msg import Imu
+from sensor_msgs.msg import Imu, Image, CameraInfo
 from tf2_ros import StaticTransformBroadcaster
 from geometry_msgs.msg import TransformStamped
+
+FP_CONTAINER = "foundationpose_calib"
+FP_CALIB_IO_HOST = Path.home() / "foundationpose" / "FoundationPose" / "calib_io"
+FP_CALIB_IO_CONTAINER = "/workspace/FoundationPose/calib_io"
+FP_PYTHON = "/opt/conda/envs/my/bin/python"
+GROUNDEDSAM_PYTHON = Path.home() / "groundedsam" / ".venv" / "bin" / "python"
+DETECT_OBJECT_SCRIPT = Path(__file__).parent / "detect_object.py"
 
 
 # ---------------------------------------------------------------------------
@@ -94,25 +107,142 @@ def pose_from_xyz_rpy(xyz, rpy) -> np.ndarray:
 
 def run_foundationpose_register(mesh_path: str, rgb: np.ndarray,
                                  depth: np.ndarray, K: np.ndarray,
-                                 mask: np.ndarray) -> np.ndarray:
+                                 mask: np.ndarray,
+                                 frame_tag: str = "frame") -> np.ndarray:
     """
-    TODO: confirm against the actual FoundationPose repo tomorrow.
-    Expected shape, based on run_demo.py's general pattern:
+    Runs FoundationPose.register() inside the foundationpose_calib
+    container via file exchange (see module docstring). Requires:
+      - `docker start foundationpose_calib` already done (container is a
+        named, persistent instance — see CLAUDE.md — not `--rm`)
+      - mesh_path readable from the HOST at the same relative path the
+        container sees it at (simplest: put meshes under
+        ~/foundationpose/FoundationPose/calib_io/ directly)
 
-        from estimater import FoundationPose  # or similar — VERIFY
-        est = FoundationPose(mesh_path=mesh_path, ...)
-        pose = est.register(K=K, rgb=rgb, depth=depth, ob_mask=mask)
-        return pose  # 4x4 np.ndarray, object-in-camera-frame
-
-    `mask` is the cube's segmentation mask in the RGB frame — get this
-    from GroundedSAM (already built as part of Container 3) prompted with
-    the cube's color/description, or a simple manual ROI for calibration
-    purposes since the scene is controlled and static.
+    `mask` is the cube's segmentation mask — from detect_object.py
+    (GroundedSAM) prompted with the cube's description.
     """
-    raise NotImplementedError(
-        "Fill in against the real FoundationPose API once confirmed — "
-        "see this function's docstring and the module-level warning."
-    )
+    FP_CALIB_IO_HOST.mkdir(parents=True, exist_ok=True)
+
+    mesh_host_path = Path(mesh_path).resolve()
+    try:
+        mesh_rel = mesh_host_path.relative_to(FP_CALIB_IO_HOST.resolve())
+    except ValueError:
+        raise RuntimeError(
+            f"--mesh must live under {FP_CALIB_IO_HOST} (the container's "
+            f"mounted calib_io/ dir) so it's visible inside the container "
+            f"at the equivalent path — got {mesh_host_path}")
+    mesh_container_path = f"{FP_CALIB_IO_CONTAINER}/{mesh_rel.as_posix()}"
+
+    rgb_path = FP_CALIB_IO_HOST / f"{frame_tag}_rgb.png"
+    depth_path = FP_CALIB_IO_HOST / f"{frame_tag}_depth.npy"
+    mask_path = FP_CALIB_IO_HOST / f"{frame_tag}_mask.npy"
+    intrinsics_path = FP_CALIB_IO_HOST / f"{frame_tag}_intrinsics.json"
+    pose_path = FP_CALIB_IO_HOST / f"{frame_tag}_pose.txt"
+
+    cv2.imwrite(str(rgb_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    np.save(depth_path, depth.astype(np.float32))
+    np.save(mask_path, mask.astype(bool))
+    with open(intrinsics_path, "w") as f:
+        json.dump({"fx": float(K[0, 0]), "fy": float(K[1, 1]),
+                   "cx": float(K[0, 2]), "cy": float(K[1, 2])}, f)
+
+    container_prefix = f"{FP_CALIB_IO_CONTAINER}/{frame_tag}"
+    cmd = [
+        "docker", "exec", "-e", "PYTHONPATH=/workspace/FoundationPose",
+        FP_CONTAINER, FP_PYTHON,
+        f"{FP_CALIB_IO_CONTAINER}/register_once.py",
+        "--mesh", mesh_container_path,
+        "--rgb", f"{container_prefix}_rgb.png",
+        "--depth", f"{container_prefix}_depth.npy",
+        "--intrinsics", f"{container_prefix}_intrinsics.json",
+        "--mask", f"{container_prefix}_mask.npy",
+        "--out", f"{container_prefix}_pose.txt",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"register_once.py failed inside container:\n{result.stderr}"
+        )
+    print(result.stdout)
+
+    return np.loadtxt(pose_path)
+
+
+# ---------------------------------------------------------------------------
+# Live frame capture — same decode logic as capture_calib_frame.py, inlined
+# so it can share the one rclpy context used for the whole script (IMU
+# check + TF publish already needed rclpy.init() at the top-level anyway).
+# ---------------------------------------------------------------------------
+
+def _decode_rgb(msg: Image) -> np.ndarray:
+    enc = msg.encoding.lower()
+    if enc in ("rgb8", "bgr8"):
+        img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
+        return cv2.cvtColor(img, cv2.COLOR_RGB2BGR) if enc == "rgb8" else img
+    if enc in ("rgba8", "bgra8"):
+        img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 4)
+        return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR if enc == "bgra8" else cv2.COLOR_RGBA2BGR)
+    raise RuntimeError(f"Unsupported colour encoding '{msg.encoding}'")
+
+
+def _decode_depth(msg: Image) -> np.ndarray:
+    enc = msg.encoding.lower()
+    if enc == "32fc1":
+        return np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width).copy()
+    if enc == "16uc1":
+        mm = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
+        return mm.astype(np.float32) / 1000.0
+    raise RuntimeError(f"Unsupported depth encoding '{msg.encoding}'")
+
+
+class SyncedFrameCapture(Node):
+    """One-shot RGB+depth+intrinsics grab per call to capture_one(), reused
+    across --num-frames calls in main()'s loop."""
+
+    def __init__(self, camera_topic_ns: str):
+        super().__init__("calib_frame_capture")
+        rgb_sub = message_filters.Subscriber(
+            self, Image, f"{camera_topic_ns}/rgb/color/rect/image")
+        depth_sub = message_filters.Subscriber(
+            self, Image, f"{camera_topic_ns}/depth/depth_registered")
+        info_sub = message_filters.Subscriber(
+            self, CameraInfo, f"{camera_topic_ns}/rgb/color/rect/camera_info")
+        self._ts = message_filters.ApproximateTimeSynchronizer(
+            [rgb_sub, depth_sub, info_sub], queue_size=10, slop=0.05)
+        self._ts.registerCallback(self._cb)
+        self._pending = None
+
+    def _cb(self, rgb_msg, depth_msg, info_msg):
+        self._pending = (_decode_rgb(rgb_msg), _decode_depth(depth_msg),
+                          np.array(info_msg.k).reshape(3, 3))
+
+    def capture_one(self, timeout_sec=15.0):
+        self._pending = None
+        start = time.time()
+        while self._pending is None and (time.time() - start) < timeout_sec:
+            rclpy.spin_once(self, timeout_sec=0.2)
+        if self._pending is None:
+            raise RuntimeError(f"No synced frame within {timeout_sec}s — "
+                                f"check ROS_DOMAIN_ID and that the ZED node is up.")
+        return self._pending
+
+
+def detect_cube_mask(rgb: np.ndarray, prompt: str, frame_tag: str) -> np.ndarray:
+    """Shells out to GroundedSAM's own venv (can't import cross-venv) — same
+    detect_object.py already verified working standalone."""
+    tmp_dir = Path(tempfile.gettempdir()) / "calib_detect" / frame_tag
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    rgb_path = tmp_dir / "rgb.png"
+    cv2.imwrite(str(rgb_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+
+    cmd = [str(GROUNDEDSAM_PYTHON), str(DETECT_OBJECT_SCRIPT),
+           "--rgb", str(rgb_path), "--prompt", prompt,
+           "--out-dir", str(tmp_dir / "detections")]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"detect_object.py failed:\n{result.stderr}")
+
+    return np.load(tmp_dir / "detections" / "mask.npy")
 
 
 # ---------------------------------------------------------------------------
@@ -193,40 +323,60 @@ class ExtrinsicPublisher(Node):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mesh", required=True)
-    parser.add_argument("--cube-xyz-in-base", nargs=3, type=float, required=True,
-                         metavar=("X", "Y", "Z"))
+    parser.add_argument("--cube-xyz-in-base", nargs=3, type=float, default=None,
+                         metavar=("X", "Y", "Z"),
+                         help="Hand-measured cube center in fr3_link0, meters. "
+                              "If omitted, only runs the vision capture/register "
+                              "step and saves T_cube_in_camera to --out-cube-pose "
+                              "for later composition once you have a real "
+                              "measurement — does not publish any TF.")
+    parser.add_argument("--out-cube-pose", default="T_cube_in_camera.txt",
+                         help="Where to save the averaged T_cube_in_camera 4x4 "
+                              "when --cube-xyz-in-base is omitted.")
     parser.add_argument("--cube-rpy-in-base", nargs=3, type=float, default=[0, 0, 0],
                          metavar=("R", "P", "Y"))
     parser.add_argument("--num-frames", type=int, default=8)
     parser.add_argument("--camera-topic-ns", default="/zed/zed_node")
     parser.add_argument("--parent-frame", default="fr3_link0")
     parser.add_argument("--child-frame", default="zed_left_camera_frame_optical")
+    parser.add_argument("--cube-prompt", default="green cube.",
+                         help="GroundedSAM text prompt for the calibration cube")
     args = parser.parse_args()
 
-    T_cube_in_base = pose_from_xyz_rpy(args.cube_xyz_in_base, args.cube_rpy_in_base)
+    have_base_measurement = args.cube_xyz_in_base is not None
+    if have_base_measurement:
+        T_cube_in_base = pose_from_xyz_rpy(args.cube_xyz_in_base, args.cube_rpy_in_base)
+
+    rclpy.init()
 
     print(f"Capturing {args.num_frames} independent register() frames — "
           f"keep the cube stationary throughout.")
-    # TODO: wire this loop to actual RGB/depth/K capture from the ZED topics
-    # (message_filters.ApproximateTimeSynchronizer, same pattern as the
-    # existing scene_observer.py) and a real segmentation mask from
-    # GroundedSAM. Left as a loop stub since it depends on the
-    # FoundationPose adapter above being filled in first.
+    capture_node = SyncedFrameCapture(args.camera_topic_ns)
     poses_cube_in_camera = []
     for i in range(args.num_frames):
-        # rgb, depth, K, mask = capture_synced_frame(args.camera_topic_ns)
-        # pose = run_foundationpose_register(args.mesh, rgb, depth, K, mask)
-        # poses_cube_in_camera.append(pose)
-        raise NotImplementedError(
-            "Wire up frame capture + run_foundationpose_register() once "
-            "FoundationPose is confirmed working standalone tomorrow."
-        )
+        print(f"  frame {i+1}/{args.num_frames} ...")
+        rgb, depth, K = capture_node.capture_one()
+        mask = detect_cube_mask(rgb, args.cube_prompt, frame_tag=f"calib_{i}")
+        pose = run_foundationpose_register(args.mesh, rgb, depth, K, mask,
+                                            frame_tag=f"calib_{i}")
+        poses_cube_in_camera.append(pose)
+        print(f"    pose translation: {pose[:3, 3]}")
+    capture_node.destroy_node()
 
     T_cube_in_camera = average_poses(poses_cube_in_camera)
+
+    if not have_base_measurement:
+        np.savetxt(args.out_cube_pose, T_cube_in_camera)
+        print(f"\nNo --cube-xyz-in-base given — saved averaged T_cube_in_camera "
+              f"to {args.out_cube_pose}. Re-run once you have the real "
+              f"caliper measurement of the cube's position in fr3_link0 to "
+              f"compose and publish the final TF.")
+        rclpy.shutdown()
+        return
+
     T_cam_in_base = T_cube_in_base @ np.linalg.inv(T_cube_in_camera)
 
     # --- IMU sanity check: roll/pitch only ---
-    rclpy.init()
     imu_node = ImuSanityCheckNode(f"{args.camera_topic_ns}/imu/data")
     orientation = imu_node.wait_for_reading()
     if orientation is not None:
@@ -243,10 +393,16 @@ def main():
     imu_node.destroy_node()
 
     publisher = ExtrinsicPublisher(T_cam_in_base, args.parent_frame, args.child_frame)
-    rclpy.spin_once(publisher, timeout_sec=1.0)
 
     print("\nFinal T_cam_in_base:")
     print(T_cam_in_base)
+    print("\nStatic TF publisher spinning — leave this process running so "
+          "/tf_static reaches subscribers that connect later (RViz, "
+          "tf2_echo, ...). Ctrl-C to stop.")
+    try:
+        rclpy.spin(publisher)
+    except KeyboardInterrupt:
+        pass
 
     rclpy.shutdown()
 
