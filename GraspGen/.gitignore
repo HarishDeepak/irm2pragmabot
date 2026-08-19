@@ -23,7 +23,12 @@
 __pycache__/*
 .cache/*
 .*.swp
-*/.ipynb_checkpoints/*
+*/.ipynb_checkpoints/
+# ...but the small YAML gripper configs ARE needed to run the server.
+!checkpoints/
+checkpoints/*
+!checkpoints/*.yml
+!checkpoints/*.yaml*
 .DS_Store
 
 # Project files
@@ -39,7 +44,11 @@ tags
 ngc/
 osmo/
 bash/
-checkpoints/
+# checkpoints/: weights are blocked by *.pth above, but the small YAML
+# gripper configs are required to start the server, so keep those.
+checkpoints/*
+!checkpoints/*.yml
+!checkpoints/*.yaml
 notes/
 
 # Package files
