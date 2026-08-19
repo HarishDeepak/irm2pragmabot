@@ -1,2 +1,5 @@
 *.pth filter=lfs diff=lfs merge=lfs -text
-*.json filter=lfs diff=lfs merge=lfs -text
+# LFS disabled: this monorepo vendors the real file content, not LFS
+# pointers. Leaving the rule active makes git warn on every clone:
+#   "Encountered N files that should have been pointers, but weren't"
+#*.json filter=lfs diff=lfs merge=lfs -text
