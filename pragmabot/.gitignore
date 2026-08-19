@@ -27,6 +27,10 @@ Thumbs.db
 *.jpg
 *.JPG
 !docs/*
+# Captured scene images ARE tracked -- rgb.png is the pipeline's input,
+# annotated.jpg is the GroundedSAM detection overlay.
+!extracted/**/*.png
+!extracted/**/*.jpg
 
 # Model weights
 *.pth
@@ -56,9 +60,15 @@ scripts/output/*
 *.log
 
 # FR3 host-adaptation workspace: rosbags, extracted frames, model checkpoints
+# Raw rosbags: 832 MB, over GitHub's 100 MB/file limit -> transferred manually.
 bags/*
 !bags/.gitkeep
-extracted/*
-!extracted/.gitkeep
+!bags/extract_bag.py
+!bags/*/metadata.yaml
+
+# extracted/ IS tracked (13 MB): lets a teammate run the perception -> grasp
+# pipeline offline without needing the rosbag.
+
+# Model weights: fetched by setup.sh from official sources.
 weights/*
 !weights/.gitkeep
