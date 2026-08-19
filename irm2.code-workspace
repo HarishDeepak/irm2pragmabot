@@ -1,0 +1,35 @@
+{
+  "folders": [
+    { "name": "Control (franka_ros2)", "path": "ros2_ws/franka_ros2" },
+    { "name": "ZED (zed_ros2_ws)",     "path": "zed_ros2_ws" },
+    { "name": "GraspGen",              "path": "GraspGen" },
+    { "name": "GroundedSAM",           "path": "groundedsam" },
+    { "name": "pragmabot",             "path": "pragmabot" },
+    { "name": "extras",                "path": "extras" }
+  ],
+  "settings": {
+    "terminal.integrated.profiles.linux": {
+      "Control (docker)": {
+        "path": "bash",
+        "args": ["-c", "docker exec -it -e DISPLAY=$DISPLAY franka_ros2_humble bash"]
+      },
+      "ZED (host)": {
+        "path": "bash",
+        "args": ["-c", "export ROS_DOMAIN_ID=7 && source /opt/ros/humble/setup.bash && source ${workspaceFolder:ZED (zed_ros2_ws)}/install/setup.bash 2>/dev/null; cd ${workspaceFolder:ZED (zed_ros2_ws)} && exec bash"]
+      },
+      "GraspGen": {
+        "path": "bash",
+        "args": ["-c", "source ${workspaceFolder:GraspGen}/.venv/bin/activate && cd ${workspaceFolder:GraspGen} && exec bash"]
+      },
+      "GroundedSAM": {
+        "path": "bash",
+        "args": ["-c", "source ${workspaceFolder:GroundedSAM}/.venv/bin/activate 2>/dev/null; cd ${workspaceFolder:GroundedSAM} && exec bash"]
+      },
+      "Bridge/Planner (pragmabot)": {
+        "path": "bash",
+        "args": ["-c", "export ROS_DOMAIN_ID=7 && source /opt/ros/humble/setup.bash && cd ${workspaceFolder:pragmabot} && exec bash"]
+      }
+    },
+    "terminal.integrated.defaultProfile.linux": "ZED (host)"
+  }
+}

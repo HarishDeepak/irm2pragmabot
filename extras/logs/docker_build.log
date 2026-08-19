@@ -1,0 +1,22 @@
+ Image franka_ros2-franka_ros2_humble Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 652B done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 3.53kB done
+#2 WARN: NoEmptyContinuation: Empty continuation line (line 79)
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/ros:humble-ros-base
+#3 DONE 1.4s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 2B done
+#4 DONE 0.0s
+
+#5 [ 1/10] FROM docker.io/library/ros:humble-ros-base@sha256:7bea3d9aa2483d3ca34c8e30d921b79273b0913bd7dc64bebf51d082b5d107e4
+#5 resolve docker.io/library/ros:humble-ros-base@sha256:7bea3d9aa2483d3ca34c8e30d921b79273b0913bd7dc64bebf51d082b5d107e4 0.0s done
+#5 DONE 0.3s
+
+#6 [internal] load build context

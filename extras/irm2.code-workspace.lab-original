@@ -1,0 +1,71 @@
+{
+  "folders": [
+    {
+      "name": "Control (franka_ros2)",
+      "path": "/home/harish/ros2_ws/franka_ros2"
+    },
+    {
+      "name": "ZED (zed_ros2_ws)",
+      "path": "/home/harish/zed_ros2_ws"
+    },
+    {
+      "name": "GraspGen",
+      "path": "/home/harish/GraspGen"
+    },
+    {
+      "name": "GroundedSAM",
+      "path": "/home/harish/groundedsam"
+    },
+    {
+      "name": "pragmabot",
+      "path": "/home/harish/pragmabot"
+    }
+  ],
+  "settings": {
+    "terminal.integrated.profiles.linux": {
+      "Control (docker)": {
+        "path": "bash",
+        "args": [
+          "-c",
+          "docker exec -it -e DISPLAY=$DISPLAY franka_ros2_humble bash"
+        ]
+      },
+      "ZED (host)": {
+        "path": "bash",
+        "args": [
+          "-c",
+          "source /opt/ros/humble/setup.bash && source /home/harish/zed_ros2_ws/install/setup.bash && exec bash"
+        ]
+      },
+      "GraspGen": {
+        "path": "bash",
+        "args": [
+          "-c",
+          "source /home/harish/GraspGen/.venv/bin/activate && cd /home/harish/GraspGen && exec bash"
+        ]
+      },
+      "GroundedSAM": {
+        "path": "bash",
+        "args": [
+          "-c",
+          "cd /home/harish/groundedsam && exec bash"
+        ]
+      },
+      "Bridge/Planner (pragmabot)": {
+        "path": "bash",
+        "args": [
+          "-c",
+          "source /opt/ros/humble/setup.bash && cd /home/harish/pragmabot && exec bash"
+        ]
+      },
+      "FoundationPose": {
+        "path": "bash",
+        "args": [
+          "-c",
+          "source /home/harish/foundationpose/.venv/bin/activate && cd /home/harish/foundationpose && exec bash"
+        ]
+      }
+    },
+    "terminal.integrated.defaultProfile.linux": "ZED (host)"
+  }
+}
