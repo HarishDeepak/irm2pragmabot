@@ -11,6 +11,10 @@
   <depend>moveit_msgs</depend>
   <depend>franka_msgs</depend>
   <depend>geometry_msgs</depend>
+  <depend>shape_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>python3-scipy</depend>
+  <depend>python3-numpy</depend>
   <depend>pragmabot_interfaces</depend>
 
   <test_depend>ament_copyright</test_depend>
