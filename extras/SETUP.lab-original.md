@@ -1,3 +1,8 @@
+> **SUPERSEDED.** This is the original lab-transfer guide (tar.gz archives,
+> separate `~/pragmabot` / `~/GraspGen` / `~/groundedsam` home directories).
+> It does NOT match the monorepo layout. Use the root `SETUP.md` instead.
+> Kept for reference because its gotchas and reasoning are still accurate.
+
 # IRM2 / pragmabot — laptop setup from these archives
 
 Built on Alonnisos (lab machine, RTX 4080, compute capability 8.9) on
