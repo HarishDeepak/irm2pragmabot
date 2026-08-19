@@ -75,6 +75,20 @@ Then follow **`SETUP.md`** to build the two virtual environments.
 
 **You do not need the rosbag to start.** `pragmabot/extracted/` is committed and holds two fully processed scenes (RGB, depth, intrinsics, masks, point clouds, grasps).
 
+### Open the whole workspace in VS Code
+
+```bash
+code irm2.code-workspace
+```
+
+Six folders in one window, each with its own terminal profile (Control-in-docker,
+ZED-on-host, GraspGen venv, GroundedSAM venv, pragmabot). Paths are relative, so
+it works wherever you clone.
+
+The original lab version, with absolute `/home/harish/...` paths, is preserved at
+`extras/irm2.code-workspace.lab-original` for reference.
+
+
 ### Verify your setup
 
 ```bash

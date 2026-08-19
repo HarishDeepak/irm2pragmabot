@@ -1,0 +1,136 @@
+=== franka_ros2_src ===
+OK-franka
+=== graspgen_full ===
+
+gzip: stdin: invalid compressed data--format violated
+tar: Unexpected EOF in archive
+tar: Unexpected EOF in archive
+tar: Error is not recoverable: exiting now
+=== groundedsam_full ===
+tar: groundedsam/Grounded-SAM-2/sam2/sam2_hiera_l.yaml: Cannot create symlink to ‘configs/sam2/sam2_hiera_l.yaml’: No such file or directory
+tar: groundedsam/Grounded-SAM-2/sam2/sam2_hiera_b+.yaml: Cannot create symlink to ‘configs/sam2/sam2_hiera_b+.yaml’: No such file or directory
+tar: groundedsam/Grounded-SAM-2/sam2/sam2_hiera_t.yaml: Cannot create symlink to ‘configs/sam2/sam2_hiera_t.yaml’: No such file or directory
+tar: groundedsam/Grounded-SAM-2/sam2/sam2_hiera_s.yaml: Cannot create symlink to ‘configs/sam2/sam2_hiera_s.yaml’: No such file or directory
+tar: Exiting with failure status due to previous errors
+=== pragmabot_full ===
+OK-pragmabot
+=== zed_ros2_ws ===
+tar: zed_ros2_ws/log/latest: Cannot create symlink to ‘latest_build’: No such file or directory
+tar: zed_ros2_ws/install/zed_ros2/share/ament_index/resource_index/packages/zed_ros2: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_ros2/ament_cmake_index/share/ament_index/resource_index/packages/zed_ros2’: No such file or directory
+tar: zed_ros2_ws/install/zed_ros2/share/ament_index/resource_index/package_run_dependencies/zed_ros2: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_ros2/ament_cmake_index/share/ament_index/resource_index/package_run_dependencies/zed_ros2’: No such file or directory
+tar: zed_ros2_ws/install/zed_ros2/share/ament_index/resource_index/parent_prefix_path/zed_ros2: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_ros2/ament_cmake_index/share/ament_index/resource_index/parent_prefix_path/zed_ros2’: No such file or directory
+tar: zed_ros2_ws/install/zed_ros2/share/zed_ros2/local_setup.dsv: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_ros2/ament_cmake_environment_hooks/local_setup.dsv’: No such file or directory
+tar: zed_ros2_ws/install/zed_ros2/share/zed_ros2/local_setup.zsh: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_ros2/ament_cmake_environment_hooks/local_setup.zsh’: No such file or directory
+tar: zed_ros2_ws/install/zed_ros2/share/zed_ros2/cmake/zed_ros2Config-version.cmake: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_ros2/ament_cmake_core/zed_ros2Config-version.cmake’: No such file or directory
+tar: zed_ros2_ws/install/zed_ros2/share/zed_ros2/cmake/zed_ros2Config.cmake: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_ros2/ament_cmake_core/zed_ros2Config.cmake’: No such file or directory
+tar: zed_ros2_ws/install/zed_ros2/share/zed_ros2/package.xml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_ros2/package.xml’: No such file or directory
+tar: zed_ros2_ws/install/zed_ros2/share/zed_ros2/local_setup.bash: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_ros2/ament_cmake_environment_hooks/local_setup.bash’: No such file or directory
+tar: zed_ros2_ws/install/zed_ros2/share/zed_ros2/local_setup.sh: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_ros2/ament_cmake_environment_hooks/local_setup.sh’: No such file or directory
+tar: zed_ros2_ws/install/zed_ros2/share/zed_ros2/environment/path.sh: Cannot create symlink to ‘/opt/ros/humble/share/ament_cmake_core/cmake/environment_hooks/environment/path.sh’: No such file or directory
+tar: zed_ros2_ws/install/zed_ros2/share/zed_ros2/environment/ament_prefix_path.dsv: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_ros2/ament_cmake_environment_hooks/ament_prefix_path.dsv’: No such file or directory
+tar: zed_ros2_ws/install/zed_ros2/share/zed_ros2/environment/path.dsv: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_ros2/ament_cmake_environment_hooks/path.dsv’: No such file or directory
+tar: zed_ros2_ws/install/zed_ros2/share/zed_ros2/environment/ament_prefix_path.sh: Cannot create symlink to ‘/opt/ros/humble/share/ament_cmake_core/cmake/environment_hooks/environment/ament_prefix_path.sh’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/ament_index/resource_index/packages/zed_wrapper: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_wrapper/ament_cmake_index/share/ament_index/resource_index/packages/zed_wrapper’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/ament_index/resource_index/package_run_dependencies/zed_wrapper: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_wrapper/ament_cmake_index/share/ament_index/resource_index/package_run_dependencies/zed_wrapper’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/ament_index/resource_index/parent_prefix_path/zed_wrapper: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_wrapper/ament_cmake_index/share/ament_index/resource_index/parent_prefix_path/zed_wrapper’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/config/zed2i.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/config/zed2i.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/config/zedxm.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/config/zedxm.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/config/zedxhdr.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/config/zedxhdr.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/config/zedxhdrmax.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/config/zedxhdrmax.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/config/common_stereo.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/config/common_stereo.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/config/zedx.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/config/zedx.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/config/zedxone4k.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/config/zedxone4k.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/config/zedxhdrmini.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/config/zedxhdrmini.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/config/object_detection.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/config/object_detection.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/config/common_mono.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/config/common_mono.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/config/zed2.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/config/zed2.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/config/zed.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/config/zed.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/config/zedxnano.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/config/zedxnano.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/config/zedxonegs.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/config/zedxonegs.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/config/custom_object_detection.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/config/custom_object_detection.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/config/virtual.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/config/virtual.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/config/zedxonehdr.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/config/zedxonehdr.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/config/zedm.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/config/zedm.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/local_setup.dsv: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_wrapper/ament_cmake_environment_hooks/local_setup.dsv’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/local_setup.zsh: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_wrapper/ament_cmake_environment_hooks/local_setup.zsh’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/cmake/zed_wrapperConfig.cmake: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_wrapper/ament_cmake_core/zed_wrapperConfig.cmake’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/cmake/zed_wrapperConfig-version.cmake: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_wrapper/ament_cmake_core/zed_wrapperConfig-version.cmake’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/launch/zed_camera.launch.py: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/launch/zed_camera.launch.py’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/package.xml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/package.xml’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/urdf/zed_macro.urdf.xacro: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/urdf/zed_macro.urdf.xacro’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/urdf/zed_descr.urdf.xacro: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_wrapper/urdf/zed_descr.urdf.xacro’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/local_setup.bash: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_wrapper/ament_cmake_environment_hooks/local_setup.bash’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/local_setup.sh: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_wrapper/ament_cmake_environment_hooks/local_setup.sh’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/environment/path.sh: Cannot create symlink to ‘/opt/ros/humble/share/ament_cmake_core/cmake/environment_hooks/environment/path.sh’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/environment/ament_prefix_path.dsv: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_wrapper/ament_cmake_environment_hooks/ament_prefix_path.dsv’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/environment/path.dsv: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_wrapper/ament_cmake_environment_hooks/path.dsv’: No such file or directory
+tar: zed_ros2_ws/install/zed_wrapper/share/zed_wrapper/environment/ament_prefix_path.sh: Cannot create symlink to ‘/opt/ros/humble/share/ament_cmake_core/cmake/environment_hooks/environment/ament_prefix_path.sh’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/include/zed_components/zed_camera_one_component.hpp: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_components/src/zed_camera_one/include/zed_camera_one_component.hpp’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/include/zed_components/sl_version.hpp: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_components/src/include/sl_version.hpp’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/include/zed_components/gnss_replay.hpp: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_components/src/tools/include/gnss_replay.hpp’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/include/zed_components/sl_tools.hpp: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_components/src/tools/include/sl_tools.hpp’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/include/zed_components/sl_types.hpp: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_components/src/tools/include/sl_types.hpp’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/include/zed_components/cost_traversability.hpp: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_components/src/zed_camera/include/cost_traversability.hpp’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/include/zed_components/sl_win_avg.hpp: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_components/src/tools/include/sl_win_avg.hpp’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/include/zed_components/sl_logging.hpp: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_components/src/tools/include/sl_logging.hpp’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/include/zed_components/zed_camera_component.hpp: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_components/src/zed_camera/include/zed_camera_component.hpp’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/include/zed_components/sl_type_adapter.hpp: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_components/src/tools/include/sl_type_adapter.hpp’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/include/zed_components/visibility_control.hpp: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_components/src/include/visibility_control.hpp’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/share/ament_index/resource_index/rclcpp_components/zed_components: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_components/ament_cmake_index/share/ament_index/resource_index/rclcpp_components/zed_components’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/share/ament_index/resource_index/packages/zed_components: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_components/ament_cmake_index/share/ament_index/resource_index/packages/zed_components’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/share/ament_index/resource_index/package_run_dependencies/zed_components: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_components/ament_cmake_index/share/ament_index/resource_index/package_run_dependencies/zed_components’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/share/ament_index/resource_index/parent_prefix_path/zed_components: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_components/ament_cmake_index/share/ament_index/resource_index/parent_prefix_path/zed_components’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/share/zed_components/local_setup.dsv: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_components/ament_cmake_environment_hooks/local_setup.dsv’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/share/zed_components/local_setup.zsh: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_components/ament_cmake_environment_hooks/local_setup.zsh’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/share/zed_components/cmake/ament_cmake_export_libraries-extras.cmake: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_components/ament_cmake_export_libraries/ament_cmake_export_libraries-extras.cmake’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/share/zed_components/cmake/zed_componentsConfig-version.cmake: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_components/ament_cmake_core/zed_componentsConfig-version.cmake’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/share/zed_components/cmake/ament_cmake_export_dependencies-extras.cmake: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_components/ament_cmake_export_dependencies/ament_cmake_export_dependencies-extras.cmake’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/share/zed_components/cmake/ament_cmake_export_include_directories-extras.cmake: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_components/ament_cmake_export_include_directories/ament_cmake_export_include_directories-extras.cmake’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/share/zed_components/cmake/zed_componentsConfig.cmake: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_components/ament_cmake_core/zed_componentsConfig.cmake’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/share/zed_components/package.xml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_components/package.xml’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/share/zed_components/local_setup.bash: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_components/ament_cmake_environment_hooks/local_setup.bash’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/share/zed_components/local_setup.sh: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_components/ament_cmake_environment_hooks/local_setup.sh’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/share/zed_components/environment/path.sh: Cannot create symlink to ‘/opt/ros/humble/share/ament_cmake_core/cmake/environment_hooks/environment/path.sh’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/share/zed_components/environment/library_path.sh: Cannot create symlink to ‘/opt/ros/humble/lib/python3.10/site-packages/ament_package/template/environment_hook/library_path.sh’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/share/zed_components/environment/ament_prefix_path.dsv: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_components/ament_cmake_environment_hooks/ament_prefix_path.dsv’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/share/zed_components/environment/library_path.dsv: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_components/ament_cmake_environment_hooks/library_path.dsv’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/share/zed_components/environment/path.dsv: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_components/ament_cmake_environment_hooks/path.dsv’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/share/zed_components/environment/ament_prefix_path.sh: Cannot create symlink to ‘/opt/ros/humble/share/ament_cmake_core/cmake/environment_hooks/environment/ament_prefix_path.sh’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/lib/libzed_camera_component.so: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_components/libzed_camera_component.so’: No such file or directory
+tar: zed_ros2_ws/install/zed_components/lib/libzed_camera_one_component.so: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_components/libzed_camera_one_component.so’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/ament_index/resource_index/packages/zed_debug: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_debug/ament_cmake_index/share/ament_index/resource_index/packages/zed_debug’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/ament_index/resource_index/package_run_dependencies/zed_debug: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_debug/ament_cmake_index/share/ament_index/resource_index/package_run_dependencies/zed_debug’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/ament_index/resource_index/parent_prefix_path/zed_debug: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_debug/ament_cmake_index/share/ament_index/resource_index/parent_prefix_path/zed_debug’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/config/zed2i.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_debug/config/zed2i.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/config/zedxm.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_debug/config/zedxm.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/config/zedxhdr.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_debug/config/zedxhdr.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/config/zedxhdrmax.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_debug/config/zedxhdrmax.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/config/common_stereo.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_debug/config/common_stereo.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/config/zedx.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_debug/config/zedx.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/config/zedxone4k.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_debug/config/zedxone4k.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/config/zedxhdrmini.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_debug/config/zedxhdrmini.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/config/object_detection.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_debug/config/object_detection.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/config/common_mono.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_debug/config/common_mono.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/config/zed2.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_debug/config/zed2.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/config/zed.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_debug/config/zed.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/config/zedxnano.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_debug/config/zedxnano.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/config/zedxonegs.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_debug/config/zedxonegs.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/config/custom_object_detection.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_debug/config/custom_object_detection.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/config/virtual.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_debug/config/virtual.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/config/zedxonehdr.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_debug/config/zedxonehdr.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/config/zedm.yaml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_debug/config/zedm.yaml’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/local_setup.dsv: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_debug/ament_cmake_environment_hooks/local_setup.dsv’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/local_setup.zsh: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_debug/ament_cmake_environment_hooks/local_setup.zsh’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/cmake/zed_debugConfig.cmake: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_debug/ament_cmake_core/zed_debugConfig.cmake’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/cmake/zed_debugConfig-version.cmake: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_debug/ament_cmake_core/zed_debugConfig-version.cmake’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/launch/zed_camera_debug.launch.py: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_debug/launch/zed_camera_debug.launch.py’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/package.xml: Cannot create symlink to ‘/home/harish/zed_ros2_ws/src/zed-ros2-wrapper/zed_debug/package.xml’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/local_setup.bash: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_debug/ament_cmake_environment_hooks/local_setup.bash’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/local_setup.sh: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_debug/ament_cmake_environment_hooks/local_setup.sh’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/environment/path.sh: Cannot create symlink to ‘/opt/ros/humble/share/ament_cmake_core/cmake/environment_hooks/environment/path.sh’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/environment/ament_prefix_path.dsv: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_debug/ament_cmake_environment_hooks/ament_prefix_path.dsv’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/environment/path.dsv: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_debug/ament_cmake_environment_hooks/path.dsv’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/share/zed_debug/environment/ament_prefix_path.sh: Cannot create symlink to ‘/opt/ros/humble/share/ament_cmake_core/cmake/environment_hooks/environment/ament_prefix_path.sh’: No such file or directory
+tar: zed_ros2_ws/install/zed_debug/lib/zed_debug/zed_debug_proc: Cannot create symlink to ‘/home/harish/zed_ros2_ws/build/zed_debug/zed_debug_proc’: No such file or directory
+tar: Exiting with failure status due to previous errors
+ALL_DONE
