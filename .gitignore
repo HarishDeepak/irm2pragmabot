@@ -18,10 +18,13 @@ GraspGenModels/
 **/gdino_checkpoints/
 weights/
 
-# ---- recorded data: transferred manually, see README ----
-bags/
-extracted/
+# ---- recorded data ----
+# Only the raw rosbag is excluded: 832 MB, over GitHub's 100 MB/file limit.
+# Transferred manually -> place at pragmabot/bags/red_cup/red_cup_0.db3
 *.db3
+
+# extracted/ (13 MB) IS tracked on purpose: it lets a teammate run the
+# perception -> grasp pipeline offline immediately, without the rosbag.
 
 # ---- python ----
 __pycache__/
