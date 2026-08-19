@@ -9,6 +9,8 @@ cmake-build-*/
 build/
 install/
 log/
-libfranka
-franka_description
-olvx_descriptions_module
+# Upstream ignores these three because it expects them cloned separately.
+# This monorepo vendors them instead, so the workspace is complete on clone.
+#libfranka
+#franka_description
+#olvx_descriptions_module

@@ -13,9 +13,9 @@ log/
 *.pt
 *.ckpt
 *.safetensors
-GraspGenModels/
-**/checkpoints/
-**/gdino_checkpoints/
+# checkpoints: weights are excluded by the *.pth/*.pt rules above, but the
+# small YAML gripper configs in GraspGenModels/checkpoints/ ARE tracked.
+**/gdino_checkpoints/*.pth
 weights/
 
 # ---- recorded data ----

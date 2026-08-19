@@ -128,14 +128,20 @@ ros2 launch zed_wrapper zed_camera.launch.py camera_model:=zed2
 
 ```bash
 # segment
-~/groundedsam/.venv/bin/python pragmabot/calibration/detect_object.py \n    --rgb pragmabot/extracted/red_cup/rgb.png --prompt "red cup."
+~/groundedsam/.venv/bin/python pragmabot/calibration/detect_object.py \
+    --rgb pragmabot/extracted/red_cup/rgb.png --prompt "red cup."
 
 # mask + depth -> object point cloud (numpy only, any venv)
-python3 pragmabot/calibration/mask_to_pointcloud.py \n    --depth pragmabot/extracted/red_cup/depth.npy \n    --intrinsics pragmabot/extracted/red_cup/intrinsics.json \n    --mask pragmabot/extracted/red_cup/detections/mask.npy \n    --out /tmp/object_pcd.npy
+python3 pragmabot/calibration/mask_to_pointcloud.py \
+    --depth pragmabot/extracted/red_cup/depth.npy \
+    --intrinsics pragmabot/extracted/red_cup/intrinsics.json \
+    --mask pragmabot/extracted/red_cup/detections/mask.npy \
+    --out /tmp/object_pcd.npy
 
 # grasps (GraspGen venv)
 source ~/GraspGen/.venv/bin/activate
-python3 GraspGen/client-server/graspgen_server.py \n    --gripper_config GraspGen/GraspGenModels/checkpoints/graspgen_franka_panda.yml &
+python3 GraspGen/client-server/graspgen_server.py \
+    --gripper_config GraspGen/GraspGenModels/checkpoints/graspgen_franka_panda.yml &
 python3 GraspGen/client-server/graspgen_client.py --pcd_file /tmp/object_pcd.npy
 ```
 
@@ -143,13 +149,20 @@ python3 GraspGen/client-server/graspgen_client.py --pcd_file /tmp/object_pcd.npy
 
 ```bash
 # in the container: gravity compensation so you can jog the arm by hand
-ros2 launch franka_bringup example.launch.py \n    controller_names:=gravity_compensation_example_controller
+ros2 launch franka_bringup example.launch.py \
+    controller_names:=gravity_compensation_example_controller
 
 # host: marker detection
-ros2 run aruco_detector aruco_detector --ros-args \n    --remap image:=/zed/zed_node/rgb/color/rect/image \n    --remap camera_info:=/zed/zed_node/rgb/color/rect/image/camera_info \n    -p marker_size:='0.05' -p image_is_rectified:=true
+ros2 run aruco_detector aruco_detector --ros-args \
+    --remap image:=/zed/zed_node/rgb/color/rect/image \
+    --remap camera_info:=/zed/zed_node/rgb/color/rect/image/camera_info \
+    -p marker_size:='0.05' -p image_is_rectified:=true
 
 # host: calibration GUI
-ros2 launch easy_handeye2 calibrate.launch.py name:=fr3_zed_right \n    calibration_type:='eye_on_base' \n    tracking_base_frame:='zed_camera_link' tracking_marker_frame:='marker_0' \n    robot_base_frame:='fr3_link0' robot_effector_frame:='fr3_hand'
+ros2 launch easy_handeye2 calibrate.launch.py name:=fr3_zed_right \
+    calibration_type:='eye_on_base' \
+    tracking_base_frame:='zed_camera_link' tracking_marker_frame:='marker_0' \
+    robot_base_frame:='fr3_link0' robot_effector_frame:='fr3_hand'
 
 # publish + verify
 ros2 launch easy_handeye2 publish.launch.py name:=fr3_zed_right
