@@ -1,4 +1,4 @@
-> Note: an earlier, longer version of these notes is kept at `LAB_NOTES_ARCHIVE.md` (376 lines) — it has calibration results and open items that were trimmed from this file.
+> Note: an earlier, longer version of these notes is kept at `LAB_README_ARCHIVE.md` (376 lines) — it has calibration results and open items that were trimmed from this file.
 
 container franka:
 echo $ROS_DOMAIN_ID
