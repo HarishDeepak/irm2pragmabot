@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # setup.sh -- fetch model checkpoints from their official sources (~2.5 GB).
-# Run once after cloning. Safe to re-run: finished files are skipped and
-# partial downloads resume.
+#
+# Safe to re-run. Each file is checked against its exact expected byte size:
+#   - correct size  -> skipped
+#   - partial       -> resumed (not skipped, not restarted)
+#   - missing       -> downloaded
 #
 # Uses curl only. No python, no pip, no wget -- so it works in Git Bash on
 # Windows, where /usr/bin/python3 has no pip and wget is not installed.
 #
 # NOT handled here (no public source):
-#   - the recorded rosbag  -> ask Harish
+#   - the recorded rosbag             -> ask Harish
 #   - the hand-eye calibration result -> from the lab machine
 
 set -eu
@@ -19,80 +22,85 @@ if ! command -v curl >/dev/null 2>&1; then
   exit 1
 fi
 
-# fetch <url> <destination-path> <human-readable-size>
-fetch() {
-  url="$1"; dest="$2"; size="$3"
-  name="$(basename "$dest")"
-  if [ -f "$dest" ]; then
-    echo "    $name ... already present, skipping"
-    return 0
-  fi
-  mkdir -p "$(dirname "$dest")"
-  echo "    $name ($size)"
-  # -L follow redirects (HuggingFace 302s to a CDN), -C - resume, -f fail on HTTP error
-  if ! curl -fL -C - --retry 3 --retry-delay 2 -o "$dest" "$url"; then
-    echo "    FAILED: $url"
-    rm -f "$dest"
-    return 1
-  fi
-}
+HF="https://huggingface.co/adithyamurali/GraspGenModels/resolve/main"
+SAM2="https://dl.fbaipublicfiles.com/segment_anything_2/092824"
+GDINO="https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha"
+
+# url | destination | exact expected size in bytes
+FILES="
+$HF/checkpoints/graspgen_franka_panda_gen.pth|GraspGen/GraspGenModels/checkpoints/graspgen_franka_panda_gen.pth|907408223
+$HF/checkpoints/graspgen_franka_panda_dis.pth|GraspGen/GraspGenModels/checkpoints/graspgen_franka_panda_dis.pth|165853892
+$SAM2/sam2.1_hiera_large.pt|groundedsam/Grounded-SAM-2/checkpoints/sam2.1_hiera_large.pt|898083611
+$GDINO/groundingdino_swint_ogc.pth|groundedsam/Grounded-SAM-2/gdino_checkpoints/groundingdino_swint_ogc.pth|693997677
+"
+
+filesize() { wc -c < "$1" 2>/dev/null | tr -d ' ' || echo 0; }
+mb() { echo $(( $1 / 1048576 )); }
 
 echo "=============================================="
 echo " IRM2 / PragmaBot -- checkpoint download"
 echo "=============================================="
 echo
 
-HF="https://huggingface.co/adithyamurali/GraspGenModels/resolve/main"
-SAM2="https://dl.fbaipublicfiles.com/segment_anything_2/092824"
-GDINO="https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha"
+n=0
+echo "$FILES" | while IFS='|' read -r url dest want; do
+  [ -z "${url:-}" ] && continue
+  n=$((n+1))
+  name="$(basename "$dest")"
+  mkdir -p "$(dirname "$dest")"
 
-echo "[1/3] GraspGen checkpoints (~1 GB)"
-fetch "$HF/checkpoints/graspgen_franka_panda_gen.pth" \
-      "GraspGen/GraspGenModels/checkpoints/graspgen_franka_panda_gen.pth" "866 MB"
-fetch "$HF/checkpoints/graspgen_franka_panda_dis.pth" \
-      "GraspGen/GraspGenModels/checkpoints/graspgen_franka_panda_dis.pth" "159 MB"
-echo
+  have=0
+  [ -f "$dest" ] && have=$(filesize "$dest")
 
-echo "[2/3] SAM 2.1 checkpoint"
-fetch "$SAM2/sam2.1_hiera_large.pt" \
-      "groundedsam/Grounded-SAM-2/checkpoints/sam2.1_hiera_large.pt" "857 MB"
-echo
+  if [ "$have" = "$want" ]; then
+    echo "[$n/4] $name ... complete ($(mb "$want") MB), skipping"
+    continue
+  fi
 
-echo "[3/3] GroundingDINO checkpoint"
-fetch "$GDINO/groundingdino_swint_ogc.pth" \
-      "groundedsam/Grounded-SAM-2/gdino_checkpoints/groundingdino_swint_ogc.pth" "662 MB"
-echo
-
-echo "=============================================="
-echo " Verifying"
-echo "=============================================="
-ok=1
-for f in \
-  GraspGen/GraspGenModels/checkpoints/graspgen_franka_panda_gen.pth \
-  GraspGen/GraspGenModels/checkpoints/graspgen_franka_panda_dis.pth \
-  groundedsam/Grounded-SAM-2/checkpoints/sam2.1_hiera_large.pt \
-  groundedsam/Grounded-SAM-2/gdino_checkpoints/groundingdino_swint_ogc.pth ; do
-  if [ -f "$f" ]; then
-    sz=$(du -m "$f" 2>/dev/null | cut -f1)
-    if [ "${sz:-0}" -lt 50 ]; then
-      echo "  SUSPICIOUS (${sz}MB, too small): $f"; ok=0
-    else
-      echo "  OK  ${sz}MB  $f"
-    fi
+  if [ "$have" -gt 0 ] 2>/dev/null; then
+    echo "[$n/4] $name ... partial ($(mb "$have")/$(mb "$want") MB), resuming"
   else
-    echo "  MISSING: $f"; ok=0
+    echo "[$n/4] $name ... downloading ($(mb "$want") MB)"
+  fi
+
+  # -C - resume, -L follow redirects, -f fail on HTTP error, --retry transient
+  curl -fL -C - --retry 3 --retry-delay 2 --progress-bar -o "$dest" "$url" || {
+    echo "      download error -- re-run this script to resume"
+  }
+done
+
+echo
+echo "=============================================="
+echo " Verifying exact sizes"
+echo "=============================================="
+fail=0
+echo "$FILES" | while IFS='|' read -r url dest want; do
+  [ -z "${url:-}" ] && continue
+  name="$(basename "$dest")"
+  have=0; [ -f "$dest" ] && have=$(filesize "$dest")
+  if [ "$have" = "$want" ]; then
+    printf "  OK        %-42s %s MB\n" "$name" "$(mb "$want")"
+  elif [ "$have" -gt 0 ] 2>/dev/null; then
+    printf "  PARTIAL   %-42s %s/%s MB\n" "$name" "$(mb "$have")" "$(mb "$want")"
+    echo "$name" >> .setup_failed
+  else
+    printf "  MISSING   %-42s\n" "$name"
+    echo "$name" >> .setup_failed
   fi
 done
-echo
 
-if [ "$ok" -ne 1 ]; then
-  echo "Some checkpoints are missing or truncated. Re-run this script -- it resumes."
+if [ -f .setup_failed ]; then
+  rm -f .setup_failed
+  echo
+  echo "Some checkpoints are incomplete. Re-run this script -- it resumes"
+  echo "from where it stopped, it does not start over."
   exit 1
 fi
 
 cat <<'NEXT'
+
 ==============================================
- Checkpoints complete. Next steps:
+ All checkpoints verified. Next steps:
 ==============================================
 
   1. Find your GPU's compute capability:
@@ -101,7 +109,7 @@ cat <<'NEXT'
 
      SETUP.md uses 8.9 (the lab machine's RTX 4080). Replace it with yours.
 
-  2. Build the TWO virtual environments -- see SETUP.md sections 2 and 3.
+  2. Build the TWO virtual environments -- SETUP.md sections 2 and 3.
      They CANNOT be merged: GraspGen pins torch==2.1.0, Grounded-SAM-2
      needs torch>=2.3.1.
 
