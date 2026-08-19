@@ -1,0 +1,31 @@
+IRM2 / PragmaBot on Franka FR3
+==============================
+
+This repository reproduces and extends PragmaBot (Qu et al., IEEE RAL 2026)
+on a Franka FR3. It vendors several third-party projects, each of which keeps
+its own LICENSE file in its own directory.
+
+IMPORTANT -- NON-COMMERCIAL COMPONENT
+-------------------------------------
+GraspGen/ is licensed under the NVIDIA License, which restricts use to
+research or evaluation purposes only (section 3.3):
+
+    "The Work and any derivative works thereof only may be used or intended
+     for use non-commercially. ... 'non-commercially' means for research or
+     evaluation purposes only."
+
+Anyone reusing this repository inherits that restriction for the GraspGen/
+component. The remaining components are Apache-2.0, BSD-3-Clause or LGPL-3.0.
+
+See THIRD_PARTY_LICENSES.md for the full attribution table.
+
+UPSTREAM
+--------
+Based on https://github.com/leggedrobotics/pragmabot (BSD-3-Clause).
+This repository's history begins at upstream commit ee68710.
+
+    Copyright (c) 2026, ETH Zurich
+    Creators: Kaixian Qu, Guowei Lan, Changan Chen
+
+No model weights are distributed here; setup.sh downloads them from their
+original sources, under their own terms.
