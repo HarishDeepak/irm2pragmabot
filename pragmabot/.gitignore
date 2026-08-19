@@ -24,6 +24,7 @@ Thumbs.db
 
 # Images (allow docs/ images for README)
 *.png
+!fps_check*.png
 *.jpg
 *.JPG
 !docs/*
@@ -62,6 +63,8 @@ scripts/output/*
 # FR3 host-adaptation workspace: rosbags, extracted frames, model checkpoints
 # Raw rosbags: 832 MB, over GitHub's 100 MB/file limit -> transferred manually.
 bags/*
+!bags/*/
+!bags/*/metadata.yaml
 !bags/.gitkeep
 !bags/extract_bag.py
 !bags/*/metadata.yaml
