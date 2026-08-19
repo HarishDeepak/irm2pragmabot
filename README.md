@@ -58,7 +58,12 @@ cd irm2pragmabot
 bash setup.sh          # ~2.5 GB of checkpoints, ~20 min
 ```
 
-Then follow **`SETUP.md`** to build the two virtual environments.
+Then follow **[`SETUP_LAPTOP.md`](SETUP_LAPTOP.md)** — the step-by-step laptop
+setup guide. It was written from an actual clone-and-run, marks every step as
+VERIFIED or NOT VERIFIED, and lists the seven problems already hit and fixed so
+you do not re-debug them.
+
+(`SETUP.md` is the shorter reference version of the same steps.)
 
 > **Two venvs, and they cannot be merged.** GraspGen pins `torch==2.1.0`; Grounded-SAM-2 needs `torch>=2.3.1`. Isolation is at the venv level, not the container level — this is deliberate.
 
