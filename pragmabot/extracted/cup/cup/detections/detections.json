@@ -1,0 +1,24 @@
+{
+  "image_path": "/home/harish/pragmabot/extracted/cup/rgb.png",
+  "prompt": "cup.",
+  "select": "best",
+  "detections": [
+    {
+      "class_name": "cup",
+      "bbox_xyxy": [
+        601.3084106445312,
+        386.9537353515625,
+        735.4580688476562,
+        529.0482788085938
+      ],
+      "score": 0.8639686703681946,
+      "segmentation_rle": {
+        "size": [
+          720,
+          1280
+        ],
+        "counts": "`PW=1oe0m0@6J5M3L3N3M2N2N2O1NRO\\[OYOOe0dd0Go[O7Pd0IS\\O6lc0JU\\O6jc0IY\\O6fc0J[\\O6cc0K^\\O5ac0K`\\O5_c0Kb\\O4^c0Lc\\O3]c0Le\\O4Zc0Mf\\O2Zc0Ng\\O1Yc0Og\\O2Xc0Ni\\O1Wc0Oj\\O1Uc0Ok\\O1Uc00j\\O1Vc0Nk\\O2Tc0Ok\\O1Uc0Ol\\O1Sc00k\\O2Sc00k\\O2Tc0Og\\O9Sc0j1A;L3L4L3N3M2N2N2O1N2N2O0O2O1N101N101O0O2O001O0O2O00001O000O2O001O000000001N100000000000000000000010O00000O100000000000001O0O1000001N10000O2O0O100O2O0O101N1O1O2O0O2N1O2N2M2O2L3M4M3H8H8C=F:I7E;G:A?Doin;"
+      }
+    }
+  ]
+}

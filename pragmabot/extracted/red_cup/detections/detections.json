@@ -1,0 +1,24 @@
+{
+  "image_path": "/home/harish/pragmabot/extracted/red_cup/rgb.png",
+  "prompt": "red cube.",
+  "select": "best",
+  "detections": [
+    {
+      "class_name": "red cube",
+      "bbox_xyxy": [
+        626.4810791015625,
+        362.61932373046875,
+        722.9197998046875,
+        463.2935791015625
+      ],
+      "score": 0.5776776075363159,
+      "segmentation_rle": {
+        "size": [
+          720,
+          1280
+        ],
+        "counts": "fdj==Qf05J6K5L3M4L6J7I7I5K4M3L3M2O1N3M3M2O1O0O2O1N2O001N101O001N10001O0000000O101O000000000001O0000000O10000000001N100O2O0O101O0O1O2O001N2O001O1O001O1O1N2O1O1O2aNl[O>Ud0_Oo[O?Sd0\\OQ\\Oc0Sd0VOQ\\Oi0ld0O1O1N101N2O1N2N2N2L4M5L6GPWW<"
+      }
+    }
+  ]
+}
