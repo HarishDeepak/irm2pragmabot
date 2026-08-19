@@ -1,7 +1,7 @@
-# Lab Notes — Archive (full version, up to 2026-07-27)
+# Lab README — Archive (full version, up to 2026-07-27)
 
 > This is the longer, earlier version of the lab notebook (376 lines).
-> The working copy `LAB_NOTES.md` (149 lines) was later trimmed and lost
+> The working copy `LAB_README.md` (149 lines) was later trimmed and lost
 > these sections. Kept because they contain calibration results and open
 > items recorded nowhere else:
 >
