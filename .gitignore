@@ -1,0 +1,40 @@
+# ---- venvs: compiled per-GPU, never portable ----
+.venv/
+**/.venv/
+.venv_py39_unused/
+
+# ---- colcon build output ----
+build/
+install/
+log/
+
+# ---- model weights: fetched by setup.sh from official sources ----
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+GraspGenModels/
+**/checkpoints/
+**/gdino_checkpoints/
+weights/
+
+# ---- recorded data: transferred manually, see README ----
+bags/
+extracted/
+*.db3
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.so
+
+# ---- secrets ----
+.env
+.env~
+*.key
+
+# ---- os / editor ----
+.DS_Store
+Thumbs.db
+*.swp
