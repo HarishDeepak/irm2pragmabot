@@ -89,6 +89,77 @@ Expect ~6 grasps at confidence 0.9+.
 
 ---
 
+## Running it
+
+### 1. Control container (FR3 + MoveIt 2)
+
+```bash
+cd ros2_ws/franka_ros2
+cp .env.example .env
+sed -i "s/^USER_UID=.*/USER_UID=$(id -u)/; s/^USER_GID=.*/USER_GID=$(id -g)/" .env
+
+docker compose build          # first time only
+docker compose up -d
+docker exec -it -e DISPLAY=$DISPLAY franka_ros2_humble bash
+```
+
+Inside the container:
+
+```bash
+source /ros2_ws/install/setup.bash        # NOT sourced in a fresh shell
+colcon build --symlink-install            # only if install/ is missing
+ros2 launch franka_fr3_moveit_config moveit.launch.py robot_ip:=10.10.10.10
+```
+
+> **Unlock the robot and activate FCI in Desk** (`https://10.10.10.10/desk/`) first, or you get `libfranka: Connection to FCI refused`.
+
+> If `install/` is missing entirely, the container was **recreated** rather than restarted — rebuild.
+
+### 2. ZED camera (host, not a container)
+
+```bash
+export ROS_DOMAIN_ID=7                    # required on EVERY terminal
+source /opt/ros/humble/setup.bash
+cd zed_ros2_ws && colcon build --symlink-install && source install/setup.bash
+ros2 launch zed_wrapper zed_camera.launch.py camera_model:=zed2
+```
+
+### 3. Perception + grasping (host, separate venvs)
+
+```bash
+# segment
+~/groundedsam/.venv/bin/python pragmabot/calibration/detect_object.py     --rgb pragmabot/extracted/red_cup/rgb.png --prompt "red cup."
+
+# mask + depth -> object point cloud (numpy only, any venv)
+python3 pragmabot/calibration/mask_to_pointcloud.py     --depth pragmabot/extracted/red_cup/depth.npy     --intrinsics pragmabot/extracted/red_cup/intrinsics.json     --mask pragmabot/extracted/red_cup/detections/mask.npy     --out /tmp/object_pcd.npy
+
+# grasps (GraspGen venv)
+source ~/GraspGen/.venv/bin/activate
+python3 GraspGen/client-server/graspgen_server.py     --gripper_config GraspGen/GraspGenModels/checkpoints/graspgen_franka_panda.yml &
+python3 GraspGen/client-server/graspgen_client.py --pcd_file /tmp/object_pcd.npy
+```
+
+### 4. Hand-eye calibration (needs the robot)
+
+```bash
+# in the container: gravity compensation so you can jog the arm by hand
+ros2 launch franka_bringup example.launch.py     controller_names:=gravity_compensation_example_controller
+
+# host: marker detection
+ros2 run aruco_detector aruco_detector --ros-args     --remap image:=/zed/zed_node/rgb/color/rect/image     --remap camera_info:=/zed/zed_node/rgb/color/rect/image/camera_info     -p marker_size:='0.05' -p image_is_rectified:=true
+
+# host: calibration GUI
+ros2 launch easy_handeye2 calibrate.launch.py name:=fr3_zed_right     calibration_type:='eye_on_base'     tracking_base_frame:='zed_camera_link' tracking_marker_frame:='marker_0'     robot_base_frame:='fr3_link0' robot_effector_frame:='fr3_hand'
+
+# publish + verify
+ros2 launch easy_handeye2 publish.launch.py name:=fr3_zed_right
+ros2 run tf2_ros tf2_echo fr3_link0 zed_camera_link
+```
+
+More detail and every gotcha: `docs/00_MASTER_REFERENCE.md`.
+
+---
+
 ## Documentation
 
 | File | What it covers |
