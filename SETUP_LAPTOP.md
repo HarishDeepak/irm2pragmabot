@@ -94,13 +94,35 @@ Observed after the torch step:
 torch 2.1.0+cu121 | cuda build 12.1 | cuda available True
 ```
 
-> **Expect this warning after the torch step, and ignore it:**
+> ### numpy 2.x breaks torch 2.1.0 — **VERIFIED, and it is fatal, not cosmetic**
+>
+> After the torch step you will see:
 > `UserWarning: Failed to initialize NumPy: _ARRAY_API not found`
 >
-> torch pulls `numpy 2.x`, but torch 2.1.0 was built against numpy 1.x.
-> GraspGen's `pyproject.toml:43` pins `numpy==1.26.4`, so the **next** command
-> (`uv pip install -e .`) downgrades numpy and the warning disappears. It is
-> only alarming if you stop halfway.
+> This is **not** a harmless warning. Verified on this laptop:
+> ```
+> numpy 2.2.6
+> torch.from_numpy(...)  ->  RuntimeError: Numpy is not available
+> ```
+> GraspGen feeds point clouds to torch as numpy arrays, so nothing works —
+> and it fails at *runtime* with a confusing message, not at install time.
+>
+> **Cause:** torch 2.1.0 was compiled against numpy 1.x; a fresh install now
+> pulls numpy 2.x.
+>
+> **Fix (verified):**
+> ```bash
+> uv pip install --python .venv/bin/python "numpy<2"
+> ```
+> ```
+> numpy 1.26.4
+> torch 2.1.0+cu121 | cuda avail True
+> torch.from_numpy OK -> (2, 3)
+> gpu -> 0.0                      # real GPU compute
+> ```
+> `uv pip install -e .` also fixes it, since GraspGen's `pyproject.toml:43`
+> pins `numpy==1.26.4` — but pin it explicitly so you are not left broken if
+> that step fails for another reason.
 
 **NOT VERIFIED:** `uv pip install -e .` builds `pointnet2_ops`, which needs
 `nvcc`. If you hit `nvcc: command not found`:
@@ -166,16 +188,20 @@ environment is wrong, not the data.
 | `wget: command not found` (would have hit next) | `gdino_checkpoints/download_ckpts.sh` calls wget unconditionally | **fixed** — `setup.sh` downloads directly, bypassing that script |
 | `Encountered 13 files that should have been pointers` | GraspGen's `.gitattributes` declared `*.json filter=lfs`, but real content is vendored | **fixed** — LFS rule disabled |
 | Truncated checkpoint silently skipped forever | skip-check tested existence, not size | **fixed** — exact byte-size verification + resume |
-| `Failed to initialize NumPy: _ARRAY_API not found` | numpy 2.x vs torch 2.1.0 ABI | **not a bug** — `uv pip install -e .` downgrades to the pinned 1.26.4 |
+| `RuntimeError: Numpy is not available` from `torch.from_numpy` | numpy 2.x vs torch 2.1.0 ABI — **fatal, breaks GraspGen entirely** | **fix**: `uv pip install --python .venv/bin/python "numpy<2"` (verified) |
 
 ## 7. Known environment limits
 
 - **No `nvcc` on a stock Windows or WSL install.** Needed to compile
   `pointnet2_ops` (GraspGen) and `ms_deform_attn` (GroundingDINO).
-- **Building on `/mnt/d` (NTFS through WSL) is slow.** For real work, clone into
-  the WSL native filesystem (`~/`) instead.
+- **Building on `/mnt/...` (NTFS through WSL) is very slow.** The torch install
+  unpacks tens of thousands of small files across WSL's 9P filesystem bridge —
+  **5-10x slower** than native ext4. Measured here: what should be a ~5-10 minute
+  install took over an hour. **Clone into the WSL native filesystem (`~/`), not
+  `/mnt/c` or `/mnt/d`.**
 - **Disk:** ~2.5 GB checkpoints + ~4 GB per venv. **VERIFIED**: the GraspGen
-  venv alone is **4.0 GB**. Budget ~15 GB.
+  venv is **4.0 GB**, of which `torch` alone is **3.65 GB** — the cu121 wheel
+  bundles cuDNN, cuBLAS, cuFFT, cuSPARSE, NCCL and NVRTC. Budget ~15 GB.
 - **ROS 2 Humble needs Ubuntu 22.04.** WSL's default 24.04 will not install it
   cleanly. Use the Docker container for ROS, or a 22.04 distro.
 
@@ -214,6 +240,9 @@ code irm2.code-workspace
 - fresh clone with no LFS warnings, no CRLF in 46 shell scripts
 - `irm2.code-workspace` folder + profile resolution
 - the offline pipeline reproducing `9.5 × 10.7 × 7.3 cm` from committed data
+
+**Also verified:** the numpy<2 pin, `torch.from_numpy`, and real GPU compute
+(`torch.zeros(3).cuda().sum()`) under WSL2.
 
 **Not executed:**
 - `uv pip install -e .` for GraspGen (needs `nvcc`)

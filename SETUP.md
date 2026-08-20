@@ -40,6 +40,7 @@ uv venv --python 3.10 .venv
 source .venv/bin/activate
 uv pip install torch==2.1.0 torchvision==0.16.0 --index-url https://download.pytorch.org/whl/cu121
 uv pip install -e .
+uv pip install "numpy<2"                # REQUIRED: numpy 2.x breaks torch 2.1.0
 export TORCH_CUDA_ARCH_LIST="8.9"      # your value; only needed if a CUDA op builds
 cd ..
 ```
