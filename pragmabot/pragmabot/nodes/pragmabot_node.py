@@ -1,19 +1,41 @@
 #!/usr/bin/env python3
-"""Main ROS node for PragmaBot with Gradio UI."""
+"""Main ROS 2 node for PragmaBot with Gradio UI.
+
+Ported from ROS 1 (rospy) to ROS 2 (rclpy). The planning/memory logic and
+the Gradio UI are unchanged - only the ROS plumbing moved.
+
+CONCURRENCY, the one thing that is genuinely different and easy to get
+wrong: Gradio launches with `prevent_thread_lock=True`, so its callbacks
+(handle_planning_request -> get_scene_observation) run on Gradio's own
+threads. Those callbacks call rclpy.spin_once() to pump subscriptions.
+
+If the main thread ALSO called rclpy.spin(), two threads would be spinning
+the same node concurrently, which rclpy does not allow - it raises, or
+worse, delivers callbacks to whichever thread got there first. So `run()`
+deliberately does NOT spin. It parks the main thread and lets the Gradio
+callback threads do all the spinning, on demand, exactly when they need a
+frame. This is correct for this design because nothing in this node needs
+callbacks serviced outside a UI action.
+
+rospy log calls map to the node's rcutils logger. Note rclpy's logger has
+no `logfatal`; that maps to `.fatal()`.
+"""
 
 import datetime
 import json
 import logging
 import os
 import sys
+import threading
 
 import matplotlib
 
 matplotlib.use("Agg")
 
 import gradio as gr
-import rospy
+import rclpy
 from openai import OpenAI
+from rclpy.node import Node
 
 from pragmabot.scene_observer import SceneObserver
 from pragmabot.simple_config import get_config
@@ -39,10 +61,16 @@ class PragmaBot:
         self.data_folder = get_package_path() / "data"
         self.log_folder = self.data_folder / "logs"
 
-        # Initialize ROS node and TF listener
-        rospy.init_node("pragmabot_node")
+        # Initialize the ROS 2 node. rclpy.init() is done by main() before
+        # constructing this class - unlike rospy, rclpy separates context
+        # initialization from node creation, and the node object is an
+        # explicit handle that must be passed to anything that subscribes.
+        self.node = Node("pragmabot_node")
+        self.logger = self.node.get_logger()
 
-        # Configure Python logging AFTER rospy.init_node(), because rospy overrides the root logger's handlers/level during initialization.
+        # Configure Python logging AFTER creating the node, because the ROS
+        # client library overrides the root logger's handlers/level during
+        # initialization (true of rclpy as it was of rospy).
         logging.basicConfig(
             level=logging.INFO, format="[%(levelname)s] [%(name)s]: %(message)s", stream=sys.stdout, force=True
         )
@@ -64,23 +92,24 @@ class PragmaBot:
 
         # Load configuration from YAML file
         self.config = get_config()
-        self.scene_observer = SceneObserver(self.config.topics)
+        self.scene_observer = SceneObserver(self.config.topics, self.node)
 
         # Select VLM client based on model name prefix
         if "gpt" in self.config.vlm.vlm_model:
             self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            rospy.loginfo(f"Using {self.config.vlm.vlm_model} with OpenAI")
+            self.logger.info(f"Using {self.config.vlm.vlm_model} with OpenAI")
             self.vlm_client = VLMClient(self.client, self.config.vlm)
         elif "claude" in self.config.vlm.vlm_model:
             from pragmabot.claude_vlm_client import ClaudeVLMClient
-            rospy.loginfo(f"Using {self.config.vlm.vlm_model} with Anthropic")
+            self.logger.info(f"Using {self.config.vlm.vlm_model} with Anthropic")
             self.vlm_client = ClaudeVLMClient(self.config.vlm)
         elif "gemini" in self.config.vlm.vlm_model:
             from pragmabot.gemini_vlm_client import GeminiVLMClient
-            rospy.loginfo(f"Using {self.config.vlm.vlm_model} with Google Gemini")
+            self.logger.info(f"Using {self.config.vlm.vlm_model} with Google Gemini")
             self.vlm_client = GeminiVLMClient(self.config.vlm)
         else:
-            rospy.logfatal("Unsupported VLM model: %s", self.config.vlm.vlm_model)
+            # rclpy's logger has no logfatal(); the equivalent is fatal().
+            self.logger.fatal(f"Unsupported VLM model: {self.config.vlm.vlm_model}")
             sys.exit(1)
 
         self.memory_manager = MemoryManager(self.vlm_client, self.conversation_log)
@@ -88,13 +117,32 @@ class PragmaBot:
         self.exp_summarizer = VLMExperienceSummarizer(self.vlm_client, self.conversation_log)
         self.success_detector = VLMSuccessDetector(self.vlm_client, self.conversation_log)
         self.task_planner = VLMTaskPlanner(self.vlm_client, self.conversation_log)
-        self.executor = PandaSkillExecutor()
+
+        # Only connect to the bridge when we will actually execute. In
+        # rosbag_replay mode nothing is executed (see handle_planning_request),
+        # and PandaSkillExecutor's constructor now raises if the bridge is
+        # absent - so constructing it unconditionally would make replay-only
+        # runs impossible on a machine with no robot.
+        if self.config.rosbag_replay:
+            self.executor = None
+            self.logger.info("rosbag_replay=true - skipping executor setup, no robot needed")
+        else:
+            self.executor = PandaSkillExecutor(self.node)
 
         self.start_gradio_interface()
 
     def run(self):
-        """Block on rospy.spin() until shutdown."""
-        rospy.spin()
+        """Park the main thread until shutdown.
+
+        Deliberately does NOT call rclpy.spin() - see the module docstring.
+        Gradio's callback threads spin the node on demand inside
+        get_scene_observation(); a second spin here would mean two threads
+        spinning one node concurrently.
+        """
+        try:
+            threading.Event().wait()
+        except KeyboardInterrupt:
+            pass
 
     def handle_planning_request(self, chatbot):
         """Run one planning step: observe scene, plan action, and execute.
@@ -142,7 +190,10 @@ class PragmaBot:
         else:
             exec_result = self.executor.execute(next_action)
             if not exec_result.get("success", False):
-                rospy.logwarn("Skill execution failed: %s", exec_result.get("message", ""))
+                # f-string, not %s-with-arg: rclpy's logger takes a single
+                # pre-formatted string and does NOT do rospy's lazy
+                # %-interpolation - the extra arg would be silently dropped.
+                self.logger.warn(f"Skill execution failed: {exec_result.get('message', '')}")
             self.handle_evaluation_request(chatbot)
 
     def handle_evaluation_request(self, chatbot):
@@ -205,7 +256,7 @@ class PragmaBot:
             The file path if saved successfully, or None on failure.
         """
         if self.instruction is None:
-            rospy.logwarn("No valid instruction — skipping log save.")
+            self.logger.warn("No valid instruction — skipping log save.")
             return
 
         # Sanitize instruction for filename
@@ -224,10 +275,10 @@ class PragmaBot:
                     indent=4,
                     ensure_ascii=False,
                 )
-            rospy.loginfo(f"Conversation log saved to: {filepath}")
+            self.logger.info(f"Conversation log saved to: {filepath}")
             return filepath
         except Exception as e:
-            rospy.logerr(f"Failed to save conversation log: {e}")
+            self.logger.error(f"Failed to save conversation log: {e}")
             return None
 
     def load_conversation_log(self, file_path, chatbot):
@@ -242,7 +293,7 @@ class PragmaBot:
         """
         if not file_path or not os.path.exists(file_path):
             error_msg = f"Error: File not found - {file_path}"
-            rospy.logerr(error_msg)
+            self.logger.error(error_msg)
             self.conversation_log.append({"role": "user", "content": error_msg})
             return self.conversation_log
 
@@ -251,12 +302,12 @@ class PragmaBot:
                 loaded_log = json.load(f)
                 if isinstance(loaded_log, list):
                     self.conversation_log = loaded_log
-                    rospy.loginfo(f"Loaded conversation log from: {file_path}")
+                    self.logger.info(f"Loaded conversation log from: {file_path}")
                 else:
                     raise ValueError("Invalid log format — expected a list of messages.")
         except Exception as e:
             error_msg = f"Failed to load conversation log: {e}"
-            rospy.logerr(error_msg)
+            self.logger.error(error_msg)
             self.conversation_log.append({"role": "user", "content": error_msg})
 
         return self.conversation_log
@@ -408,16 +459,35 @@ class PragmaBot:
         demo.launch(share=self.config.gradio_share, inline=False, prevent_thread_lock=True, server_name="0.0.0.0")
 
 
-if __name__ == "__main__":
-    pragmabot = PragmaBot()
+def main(args=None):
+    """Entry point. rclpy.init() must run before any Node is constructed.
 
+    Uses the module-level `logger` rather than a node logger: the node may
+    not exist yet if construction itself fails, which is exactly when the
+    error message matters most.
+    """
+    rclpy.init(args=args)
+
+    pragmabot = None
     try:
+        pragmabot = PragmaBot()
         pragmabot.run()
-    except rospy.ROSInterruptException:
-        rospy.loginfo("ROS Interrupt received. Shutting down...")
+    except KeyboardInterrupt:
+        logger.info("Interrupt received. Shutting down...")
     except Exception as e:
-        rospy.logerr(f"Unexpected error: {e}")
+        logger.error(f"Unexpected error: {e}", exc_info=True)
     finally:
-        rospy.loginfo("Saving conversation log before shutdown...")
-        pragmabot.save_conversation_log()
-        rospy.loginfo("Cleanup completed. Node terminated.")
+        if pragmabot is not None:
+            logger.info("Saving conversation log before shutdown...")
+            pragmabot.save_conversation_log()
+            pragmabot.node.destroy_node()
+        # Guard: rclpy.shutdown() raises if the context is already down
+        # (e.g. Ctrl-C already tore it down), which would mask the real
+        # error being handled above.
+        if rclpy.ok():
+            rclpy.shutdown()
+        logger.info("Cleanup completed. Node terminated.")
+
+
+if __name__ == "__main__":
+    main()

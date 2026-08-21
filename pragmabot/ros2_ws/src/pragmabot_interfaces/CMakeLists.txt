@@ -10,15 +10,14 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 
-# NOTE: action file list intentionally left as a TODO.
-# Open decision (see ../../../session_prompt.md): one collapsed
-# ExecuteSkill.action, or PandaPick/PandaPlace/PandaPush kept separate
-# (ported from repo_reference/IRM2's ROS1 .action files). Decide before
-# uncommenting below and adding the actual .action file(s) under action/.
-#
-# rosidl_generate_interfaces(${PROJECT_NAME}
-#   "action/ExecuteSkill.action"
-#   DEPENDENCIES geometry_msgs std_msgs
-# )
+# Decision resolved: ONE collapsed ExecuteSkill.action, not separate
+# PandaPick/PandaPlace/PandaPush. The planner emits a single `chosen_skill`
+# enum inside one NextBestAction, and bridge_node dispatches all three down
+# a shared path - three actions would split what is already one field.
+# Rationale in full at the top of action/ExecuteSkill.action.
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "action/ExecuteSkill.action"
+  DEPENDENCIES geometry_msgs std_msgs
+)
 
 ament_package()
