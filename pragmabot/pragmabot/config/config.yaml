@@ -19,7 +19,19 @@ vlm:
   text_embedding_model: text-embedding-3-large
 
 # --- ROS Topics ---
+# Verified against bags/red_cup/metadata.yaml (the only recording we have).
+# Upstream's defaults were /zedxm/... - the ANYmal robot's camera, not ours.
+# Three differences from upstream, all confirmed from the bag:
+#   1. /zedxm/ -> /zed/          (different camera on this robot)
+#   2. color is raw sensor_msgs/Image, NOT CompressedImage - there is no
+#      /compressed topic in the bag at all. scene_observer subscribes with
+#      the type named by color_image_compressed below.
+#   3. camera_info is nested under the image topic
+#      (/rgb/color/rect/image/camera_info), not a sibling /rgb/camera_info.
 topics:
-  color_image: /zedxm/zed_node/rgb/image_rect_color/compressed
-  depth_image: /zedxm/zed_node/depth/depth_registered
-  camera_info: /zedxm/zed_node/rgb/camera_info
+  color_image: /zed/zed_node/rgb/color/rect/image
+  depth_image: /zed/zed_node/depth/depth_registered
+  camera_info: /zed/zed_node/rgb/color/rect/image/camera_info
+  # true  -> subscribe to color_image as sensor_msgs/CompressedImage
+  # false -> subscribe as sensor_msgs/Image (what our bag actually contains)
+  color_image_compressed: false
