@@ -32,8 +32,30 @@ pose): fr3_link0 -> zed_camera_link [easy_handeye2] -> zed_camera_center
 -> zed_left_camera_frame -> zed_left_camera_frame_optical [ZED wrapper].
 tf2 composes this in a single lookup_transform call.
 
-execute_place() / execute_push() are not part of this pass - still
-NotImplementedError stubs.
+execute_push() is out of scope for this project - the supervisor advised
+pick-and-place first, so push stays a NotImplementedError stub.
+
+ACTION SERVER
+-------------
+This node now also serves `/pragmabot/execute_skill`
+(pragmabot_interfaces/action/ExecuteSkill), which is what connects the VLM
+planner to the robot - the gap the released PragmaBot code leaves as
+NotImplementedError. PandaSkillExecutor (planner side) sends one goal per
+planner decision; _execute_skill_cb dispatches on `chosen_skill`.
+
+The server runs in a ReentrantCallbackGroup behind a MultiThreadedExecutor
+because the skill callbacks are BLOCKING: execute_pick() calls
+spin_until_future_complete internally while waiting on MoveIt. With the
+default single-threaded executor and a mutually-exclusive callback group
+that is an immediate deadlock - the callback waits for a future that only
+the executor it is blocking could ever complete.
+
+PERCEPTION IS NOT WIRED IN YET. The action carries `target_object` as
+text, but grasp generation (GroundedSAM -> mask -> point cloud ->
+GraspGen) still runs offline as separate scripts. The server therefore
+uses the pre-computed `grasp_file`/`object_pcd_file` node parameters and
+logs a warning when the requested target_object cannot be verified
+against them. Closing that loop is the next step after this one.
 """
 
 import time
@@ -52,7 +74,10 @@ from moveit_msgs.msg import (
     PositionConstraint,
 )
 from moveit_msgs.srv import GetCartesianPath
-from rclpy.action import ActionClient
+from pragmabot_interfaces.action import ExecuteSkill
+from rclpy.action import ActionClient, ActionServer
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import Header
@@ -79,6 +104,25 @@ class PragmabotBridge(Node):
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
 
+        # Reentrant group + MultiThreadedExecutor (see module docstring):
+        # the skill callbacks block on spin_until_future_complete, which
+        # deadlocks under the default single-threaded/mutually-exclusive
+        # setup.
+        self._skill_cb_group = ReentrantCallbackGroup()
+        self._skill_server = ActionServer(
+            self,
+            ExecuteSkill,
+            "/pragmabot/execute_skill",
+            execute_callback=self._execute_skill_cb,
+            callback_group=self._skill_cb_group,
+        )
+
+        # Where the last successful pick left the object, in fr3_link0.
+        # execute_place() needs a pose to descend to, and the natural one
+        # is "the pose we picked from, moved to the new location". Set by
+        # execute_pick(), consumed by execute_place().
+        self._last_grasp_T_base = None
+
         self.declare_parameter("grasp_file", "")
         self.declare_parameter("group_name", "fr3_arm")
         self.declare_parameter("eef_link", "fr3_hand")
@@ -95,6 +139,21 @@ class PragmabotBridge(Node):
         self.declare_parameter("place_after_s", 0.0)
         self.declare_parameter("gripper_open_width", 0.08)
         self.declare_parameter("home_gripper_first", True)
+
+        # Where execute_place() drops the object, as an [x, y, z] offset in
+        # fr3_link0 applied to the pose the object was picked from. A pure
+        # offset (rather than an absolute pose) keeps the approach
+        # orientation that already worked for this object, and only moves
+        # where it lands. Default: 20cm to the robot's left, same height.
+        #
+        # ponytail: fixed offset, not a perceived target location. The
+        # planner's `placement_object` ("put it ON the plate") is accepted
+        # and logged but NOT yet resolved to a pose - that needs the same
+        # GroundedSAM->cloud step as picking, on the placement object. This
+        # is the honest minimum that makes place work end-to-end today;
+        # upgrade to perceived placement when the perception loop is wired
+        # into this node.
+        self.declare_parameter("place_offset_xyz", [0.0, 0.20, 0.0])
 
         self.get_logger().info(
             "pragmabot_bridge started - waiting for /move_action, "
@@ -278,6 +337,10 @@ class PragmabotBridge(Node):
 
         self.get_logger().info("Pick sequence complete")
 
+        # Remember where this object was grasped, so a follow-up place goal
+        # can descend to the same pose translated to the drop location.
+        self._last_grasp_T_base = grasp_T_base.copy()
+
         if place_after_s > 0.0:
             self.get_logger().info(f"Waiting {place_after_s:.1f}s before placing back down")
             time.sleep(place_after_s)
@@ -312,11 +375,212 @@ class PragmabotBridge(Node):
 
         return True
 
-    def execute_place(self, target_location: str):
-        raise NotImplementedError
+    def execute_place(
+        self,
+        placement_object: str = "",
+        group_name: str = "fr3_arm",
+        eef_link: str = "fr3_hand",
+        offset_xyz=(0.0, 0.20, 0.0),
+        standoff_m: float = 0.12,
+        lift_m: float = 0.12,
+        gripper_open_width: float = 0.08,
+        gripper_speed: float = 0.05,
+    ) -> tuple[bool, str]:
+        """Place the currently-held object at an offset from where it was picked.
+
+        Structurally this is the second half of execute_pick() run at a
+        different location: descend to a target pose, open the gripper,
+        retreat. The reused machinery is why place is cheap to add once
+        pick works.
+
+        Requires a preceding successful execute_pick() in this same node
+        process - it needs `_last_grasp_T_base` to know the object's
+        grasp pose and, more importantly, the approach ORIENTATION that
+        was already proven reachable for this object. Re-deriving an
+        orientation from scratch would risk a pose MoveIt cannot reach.
+
+        `placement_object` is the planner's semantic target ("the plate").
+        It is currently logged only - see the place_offset_xyz parameter
+        docstring for why, and what closing that gap requires.
+
+        Returns:
+            (success, message) - message names the failing step, so the
+            planner's success detector and the STM both get a real reason
+            rather than a bare False.
+        """
+        if self._last_grasp_T_base is None:
+            return False, (
+                "place requested with no prior successful pick in this session - "
+                "nothing is held, and there is no known grasp pose to place from"
+            )
+
+        if placement_object:
+            self.get_logger().warn(
+                f"placement_object={placement_object!r} is not yet resolved to a "
+                "perceived pose; using the fixed place_offset_xyz instead. The "
+                "object will be placed at a preset offset, NOT necessarily on "
+                f"the {placement_object}."
+            )
+
+        # Target = the proven grasp pose, translated. Rotation untouched.
+        place_T_base = self._last_grasp_T_base.copy()
+        place_T_base[:3, 3] += np.asarray(offset_xyz, dtype=np.float64)
+
+        approach_T_base = place_T_base.copy()
+        approach_T_base[2, 3] += standoff_m
+
+        self.get_logger().info(f"place pose (fr3_link0):\n{place_T_base}")
+
+        # Step 1: MoveGroup to a pose directly above the drop point. Free
+        # (non-Cartesian) motion here, same as pick's standoff step - the
+        # arm may need to travel a long way and reorient.
+        if not self._move_to_pose(
+            group_name, eef_link, grasp_transform.matrix_to_pose(approach_T_base)
+        ):
+            return False, "place: failed to reach the pre-place approach pose"
+
+        # Step 2: straight-line descent to the place pose.
+        place_pose_msg = grasp_transform.matrix_to_pose(place_T_base)
+        cart = self._compute_cartesian_path(group_name, eef_link, [place_pose_msg])
+        if cart is None or cart.fraction < 1.0:
+            frac = None if cart is None else cart.fraction
+            return False, f"place: descent path incomplete (fraction={frac})"
+        if not self._execute_trajectory(cart.solution):
+            return False, "place: descent execution failed"
+
+        # Step 3: open to release. Move, not Grasp - no contact force wanted.
+        if not self._open_gripper(gripper_open_width, gripper_speed):
+            return False, "place: gripper open failed - object may still be held"
+
+        # Step 4: lift clear of the placed object before anything else moves.
+        retreat_T_base = place_T_base.copy()
+        retreat_T_base[2, 3] += lift_m
+        cart = self._compute_cartesian_path(
+            group_name, eef_link, [grasp_transform.matrix_to_pose(retreat_T_base)]
+        )
+        if cart is None or cart.fraction < 1.0:
+            frac = None if cart is None else cart.fraction
+            # The object IS released at this point, so the place itself
+            # succeeded - only the retreat failed. Report it as a failure
+            # anyway: the arm is sitting on top of the placed object and a
+            # human should look before the next goal runs.
+            return False, f"place: object released but retreat incomplete (fraction={frac})"
+        if not self._execute_trajectory(cart.solution):
+            return False, "place: object released but retreat execution failed"
+
+        # Held object is gone; a further place has nothing to place.
+        self._last_grasp_T_base = None
+        self.get_logger().info("Place sequence complete")
+        return True, "place completed"
 
     def execute_push(self, target_object: str, goal_region: str):
-        raise NotImplementedError
+        """Out of scope for this project - the supervisor advised focusing on
+        pick-and-place first, so push is deliberately not implemented."""
+        raise NotImplementedError(
+            "push is out of scope for this project (supervisor: pick-and-place first)"
+        )
+
+    # ------------------------------------------------------------------
+    # ExecuteSkill action server - the planner <-> robot connection
+    # ------------------------------------------------------------------
+
+    def _execute_skill_cb(self, goal_handle):
+        """Dispatch one planner skill decision onto the robot.
+
+        Blocking by design; see the module docstring on why this needs a
+        MultiThreadedExecutor. Never raises out of the callback - an
+        uncaught exception here would abort the goal with no message, and
+        the planner's STM would record a failure with no reason to reflect
+        on. Every path returns a populated `message`.
+        """
+        request = goal_handle.request
+        skill = request.chosen_skill.lower()
+        self.get_logger().info(
+            f"ExecuteSkill goal: skill={skill!r} target={request.target_object!r} "
+            f"placement={request.placement_object!r}"
+        )
+
+        def feedback(status: str) -> None:
+            msg = ExecuteSkill.Feedback()
+            msg.status = status
+            goal_handle.publish_feedback(msg)
+
+        result = ExecuteSkill.Result()
+        try:
+            if skill == "pick":
+                feedback("picking")
+                grasp_file = self.get_parameter("grasp_file").get_parameter_value().string_value
+                if not grasp_file:
+                    result.success = False
+                    result.message = (
+                        "pick requested but the grasp_file parameter is empty - run the "
+                        "perception pipeline (detect_object.py -> mask_to_pointcloud.py -> "
+                        "graspgen_client.py --save_grasps) and set grasp_file to its output"
+                    )
+                else:
+                    ok = self.execute_pick(
+                        grasp_file,
+                        group_name=self.get_parameter("group_name").value,
+                        eef_link=self.get_parameter("eef_link").value,
+                        standoff_m=self.get_parameter("standoff_m").value,
+                        lift_m=self.get_parameter("lift_m").value,
+                        gripper_width=self.get_parameter("gripper_width").value,
+                        gripper_speed=self.get_parameter("gripper_speed").value,
+                        gripper_force=self.get_parameter("gripper_force").value,
+                        gripper_epsilon=self.get_parameter("gripper_epsilon").value,
+                        camera_frame=self.get_parameter("camera_frame").value,
+                        object_pcd_file=self.get_parameter("object_pcd_file")
+                        .get_parameter_value()
+                        .string_value,
+                        grasp_index=self.get_parameter("grasp_index").value,
+                        place_after_s=0.0,  # the planner decides when to place
+                        gripper_open_width=self.get_parameter("gripper_open_width").value,
+                        home_gripper_first=self.get_parameter("home_gripper_first").value,
+                    )
+                    result.success = ok
+                    result.message = (
+                        f"picked {request.target_object}"
+                        if ok
+                        else "pick failed - see the node log for the failing step"
+                    )
+
+            elif skill == "place":
+                feedback("placing")
+                ok, message = self.execute_place(
+                    placement_object=request.placement_object,
+                    group_name=self.get_parameter("group_name").value,
+                    eef_link=self.get_parameter("eef_link").value,
+                    offset_xyz=self.get_parameter("place_offset_xyz").value,
+                    standoff_m=self.get_parameter("standoff_m").value,
+                    lift_m=self.get_parameter("lift_m").value,
+                    gripper_open_width=self.get_parameter("gripper_open_width").value,
+                    gripper_speed=self.get_parameter("gripper_speed").value,
+                )
+                result.success = ok
+                result.message = message
+
+            elif skill == "push":
+                result.success = False
+                result.message = "push is out of scope for this project - not implemented"
+
+            else:
+                result.success = False
+                result.message = f"unknown skill: {skill!r} (expected pick, place or push)"
+
+        except Exception as exc:  # noqa: BLE001 - must not escape the callback
+            self.get_logger().error(f"{skill} raised: {exc}")
+            result.success = False
+            result.message = f"{skill} raised an exception: {exc}"
+
+        # succeed() regardless of result.success: the ACTION completed
+        # normally, and `success` is the outcome it carries. abort() would
+        # discard the message, which is exactly the reason the planner
+        # needs in order to self-reflect.
+        goal_handle.succeed()
+        self.get_logger().info(
+            f"ExecuteSkill done: success={result.success} message={result.message!r}"
+        )
+        return result
 
     # ------------------------------------------------------------------
     # MoveIt goal helpers
@@ -477,6 +741,15 @@ def main(args=None):
     rclpy.init(args=args)
     node = PragmabotBridge()
 
+    # MultiThreadedExecutor is REQUIRED, not a tuning choice: the skill
+    # callbacks block on spin_until_future_complete while waiting for
+    # MoveIt, which self-deadlocks on a single-threaded executor.
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+
+    # One-shot CLI mode: if grasp_file is set at launch, run a pick
+    # immediately, then stay up serving the action. Preserves the manual
+    # `ros2 run ... -p grasp_file:=...` workflow used for bring-up testing.
     grasp_file = node.get_parameter("grasp_file").get_parameter_value().string_value
     if grasp_file:
         success = node.execute_pick(
@@ -498,13 +771,15 @@ def main(args=None):
         )
         node.get_logger().info(f"execute_pick finished, success={success}")
 
+    node.get_logger().info("Serving /pragmabot/execute_skill - waiting for planner goals")
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

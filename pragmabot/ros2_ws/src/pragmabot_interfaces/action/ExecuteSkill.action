@@ -1,0 +1,31 @@
+# One collapsed action for all three skills, rather than separate
+# PandaPick/PandaPlace/PandaPush actions.
+#
+# Why collapsed: the planner emits a single `chosen_skill` enum
+# (vlm_task_planner.py:73-79, RobotSkill = PUSH|PICK|PLACE) inside one
+# NextBestAction object, and bridge_node.py dispatches all three down a
+# shared path. Three separate actions would mean three clients, three
+# servers and a dispatch switch on both sides to carry what is already
+# one field.
+#
+# Field names mirror NextBestAction exactly (vlm_task_planner.py:88-128)
+# so the executor is a straight field copy with no renaming. The ROS 1
+# executor renamed them and got it wrong twice - it read `action.skill`
+# (AttributeError, the field is `chosen_skill`) and `target_location`
+# (silently empty, the field is `placement_object`). Keeping the names
+# identical is what stops that recurring.
+
+# --- Goal ---
+string chosen_skill                     # "pick" | "place" | "push"
+string target_object                    # object to pick, place, or push
+string placement_object                 # "" unless chosen_skill == "place"
+string push_direction                   # "" unless chosen_skill == "push"; "left" | "right"
+bool should_grasp_at_specific_section   # false unless chosen_skill == "pick"
+bool should_place_at_specific_section   # false unless chosen_skill == "place"
+---
+# --- Result ---
+bool success
+string message                          # failure reason, or a short note on success
+---
+# --- Feedback ---
+string status                           # human-readable progress, e.g. "moving to standoff"
