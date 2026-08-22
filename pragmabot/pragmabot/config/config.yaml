@@ -1,6 +1,13 @@
 rosbag_replay: true
 gradio_share: false
 
+# Hard cap on planning steps per task. Both a safety valve (an uncapped VLM
+# commanding a 7-DoF arm is the most dangerous thing in this codebase) and a
+# measurement: "steps to completion, capped at N" is the paper's headline
+# metric, and an uncapped run has no denominator. Also bounds STM growth,
+# since every STM entry is re-sent in every later planner prompt.
+max_steps: 10
+
 # --- Memory Settings ---
 activate_stm: true
 activate_ltm: true
@@ -14,9 +21,25 @@ retrieval_top_k: 5  # -1 for everything (unsorted)
 # Gemini:   vlm_model: gemini-2.5-pro       (needs GOOGLE_API_KEY)
 vlm:
   vlm_model: claude-opus-4-8
-  # text_embedding_model is only used with OpenAI. Claude uses sentence-transformers
-  # (all-MiniLM-L6-v2 locally). Gemini uses models/text-embedding-004 natively.
-  text_embedding_model: text-embedding-3-large
+  # text_embedding_model does MORE than pick a model: MemoryManager.__init__
+  # builds the embeddings filename from it (ltm_<name>.csv), which is the
+  # only thing stopping vectors from one backend being read as another's.
+  #
+  # It must therefore name the model that ACTUALLY produced the vectors.
+  # It said `text-embedding-3-large` (3072-d, OpenAI) while the Claude path
+  # hardcodes all-MiniLM-L6-v2 (384-d, local, claude_vlm_client.py:71) - so
+  # the file was named after a model that never computed its contents.
+  #
+  # Change this only together with re-embedding the LTM: a new name means a
+  # new filename, which means every existing row loses its embedding and
+  # retrieval raises TypeError (see data/ltm/archive/README.md).
+  #
+  # NOTE for the report: MiniLM truncates at 256 word-pieces, and the
+  # scenario key is instruction + full scene description - often longer.
+  # Retrieval is then keyed on a truncated prefix. This is a real deviation
+  # from the paper's 3072-d embeddings and is worth an explicit ablation
+  # rather than a silent difference.
+  text_embedding_model: all-MiniLM-L6-v2
 
 # --- ROS Topics ---
 # Verified against bags/red_cup/metadata.yaml (the only recording we have).
