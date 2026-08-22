@@ -1,32 +1,40 @@
 <?xml version="1.0"?>
-<package format="2">
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
     <name>pragmabot</name>
     <version>1.0.0</version>
-    <description>PragmaBot: Learning to plan tasks by experiencing the real world</description>
+    <description>PragmaBot: Learning to plan tasks by experiencing the real world (FR3 / ROS 2 port)</description>
 
+    <!-- Upstream authors, retained: the 14 VLM/memory modules are theirs and
+         are deliberately unmodified. Only the ROS plumbing was ported. -->
     <maintainer email="kaixqu@ethz.ch">Kaixian Qu</maintainer>
-    <maintainer email="guolan@ethz.ch">Guowei Lan</maintainer>
-    <maintainer email="chencha@ethz.ch">Changan Chen</maintainer>
+    <maintainer email="harish.deepak.c@gmail.com">Harish Deepak</maintainer>
     <license>BSD-3-Clause</license>
 
     <url type="website">https://pragmabot.github.io</url>
     <url type="repository">https://github.com/leggedrobotics/pragmabot</url>
 
-    <buildtool_depend>catkin</buildtool_depend>
+    <buildtool_depend>ament_python</buildtool_depend>
 
-    <depend>rospy</depend>
+    <depend>rclpy</depend>
     <depend>sensor_msgs</depend>
     <depend>geometry_msgs</depend>
     <depend>cv_bridge</depend>
     <depend>message_filters</depend>
-    <depend>topic_tools</depend>
-    <depend>tf</depend>
+    <depend>pragmabot_interfaces</depend>
 
-    <build_depend>actionlib</build_depend>
-    <build_depend>actionlib_msgs</build_depend>
-    <build_depend>message_generation</build_depend>
-    <exec_depend>actionlib</exec_depend>
-    <exec_depend>actionlib_msgs</exec_depend>
-    <exec_depend>message_runtime</exec_depend>
+    <!-- Dropped from the ROS 1 manifest, deliberately:
+         rospy/actionlib/actionlib_msgs/message_generation/message_runtime
+           -> replaced by rclpy + pragmabot_interfaces (rosidl).
+         tf -> the bridge uses tf2_ros; this package needs no TF at all.
+         topic_tools -> only used by the ROS 1 image_republisher path. -->
 
+    <test_depend>ament_copyright</test_depend>
+    <test_depend>ament_flake8</test_depend>
+    <test_depend>ament_pep257</test_depend>
+    <test_depend>python3-pytest</test_depend>
+
+    <export>
+        <build_type>ament_python</build_type>
+    </export>
 </package>
