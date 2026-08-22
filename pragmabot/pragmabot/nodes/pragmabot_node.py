@@ -145,14 +145,45 @@ class PragmaBot:
             pass
 
     def handle_planning_request(self, chatbot):
-        """Run one planning step: observe scene, plan action, and execute.
+        """Run planning steps until the task completes or the cap is hit.
 
-        Captures a camera observation, optionally generates a scene description,
-        queries the VLM action planner, and dispatches the resulting action
-        to the function call handler and behavior tree.
+        Was mutual RECURSION, not a loop: this method called
+        handle_evaluation_request, which called this method again on failure,
+        with no bound. Three consequences, all real:
+
+          1. No step cap - a VLM that never reports completion drives the
+             arm indefinitely and bills every step.
+          2. Each frame holds two PIL images alive, so memory grew linearly
+             with step count.
+          3. At ~500 steps Python raises RecursionError inside a Gradio
+             callback thread, where main()'s `finally` never runs - so the
+             conversation log is never saved. The most expensive run is the
+             one you cannot write up.
+
+        The cap is also a scientific instrument, not just a safety valve:
+        "steps to completion, capped at N" is the paper's headline metric,
+        and an uncapped run has no denominator.
 
         Args:
             chatbot: Gradio chatbot component (unused, kept for callback API).
+        """
+        max_steps = int(getattr(self.config, "max_steps", 10))
+        for _ in range(max_steps):
+            if self._plan_one_step(chatbot):
+                return
+
+        # Recorded in STM, not just logged: an abort is a real outcome the
+        # experience summarizer should see, and "ran out of steps" is a
+        # different failure from "the action failed".
+        msg = f"Task aborted: reached max_steps={max_steps} without completion."
+        self.logger.warn(msg)
+        self.append_to_stm_if_activated("additional_info", msg)
+
+    def _plan_one_step(self, chatbot) -> bool:
+        """Run exactly one plan -> execute -> evaluate step.
+
+        Returns:
+            True if the task is complete and the loop should stop.
         """
         self.time_step += 1
 
@@ -186,24 +217,39 @@ class PragmaBot:
 
         if self.config.rosbag_replay:
             # Send a request for success detection if no action execution
-            self.handle_evaluation_request(chatbot)
-        else:
-            exec_result = self.executor.execute(next_action)
-            if not exec_result.get("success", False):
-                # f-string, not %s-with-arg: rclpy's logger takes a single
-                # pre-formatted string and does NOT do rospy's lazy
-                # %-interpolation - the extra arg would be silently dropped.
-                self.logger.warn(f"Skill execution failed: {exec_result.get('message', '')}")
-            self.handle_evaluation_request(chatbot)
+            return self.handle_evaluation_request(chatbot)
 
-    def handle_evaluation_request(self, chatbot):
+        exec_result = self.executor.execute(next_action)
+        if not exec_result.get("success", False):
+            # f-string, not %s-with-arg: rclpy's logger takes a single
+            # pre-formatted string and does NOT do rospy's lazy
+            # %-interpolation - the extra arg would be silently dropped.
+            self.logger.warn(f"Skill execution failed: {exec_result.get('message', '')}")
+            # Feed the executor's REASON into STM, not just the log. The
+            # planner self-reflects on this text ("gripper already holds an
+            # object", "Cartesian fraction 0.4") - a bare False gives it
+            # nothing to reason about, which is the paper's whole mechanism.
+            self.append_to_stm_if_activated(
+                "additional_info",
+                f"Skill execution failed: {exec_result.get('message', '')}",
+            )
+        return self.handle_evaluation_request(chatbot)
+
+    def handle_evaluation_request(self, chatbot) -> bool:
         """Evaluate action success by comparing before/after observations.
 
-        Captures a new observation, sends the before/after images to the VLM
-        success detector, and handles task completion or re-planning.
+        Captures a new observation and sends the before/after images to the
+        VLM success detector.
+
+        Previously ended by calling handle_planning_request() again, which is
+        what made the plan/evaluate cycle unbounded recursion. It now just
+        reports the outcome and lets the caller's loop decide.
 
         Args:
             chatbot: Gradio chatbot component (unused, kept for callback API).
+
+        Returns:
+            True if the task is complete and planning should stop.
         """
 
         color_image_before_action = self.color_image
@@ -226,14 +272,14 @@ class PragmaBot:
         if success_evaluation.is_task_completed:
             if self.config.save_to_ltm:
                 self.handle_experience_summarization(chatbot)
-        else:
+            return True
 
-            if not success_evaluation.is_action_successful:
-                info_msg = "The human operator might have reset the scene after the action failure."
-                self.append_to_stm_if_activated("additional_info", info_msg)
+        if not success_evaluation.is_action_successful:
+            info_msg = "The human operator might have reset the scene after the action failure."
+            self.append_to_stm_if_activated("additional_info", info_msg)
 
-            # loop back to planning
-            self.handle_planning_request(chatbot)
+        # Not complete - the caller's bounded loop plans the next step.
+        return False
 
     def handle_experience_summarization(self, chatbot):
         """Summarize the current short-term memory into a long-term experience entry.
