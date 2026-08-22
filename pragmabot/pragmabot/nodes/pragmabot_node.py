@@ -127,7 +127,16 @@ class PragmaBot:
             self.executor = None
             self.logger.info("rosbag_replay=true - skipping executor setup, no robot needed")
         else:
-            self.executor = PandaSkillExecutor(self.node)
+            # SEPARATE node, not self.node. Both SceneObserver and the
+            # executor block by spinning the node they are given, and a
+            # planning step interleaves them (observe -> plan -> execute ->
+            # observe). Sharing one node means two spin calls racing on the
+            # same executor: rclpy either raises, or delivers a completed
+            # future to whichever waiter got there first - so the skill
+            # result never reaches the caller and it sits until timeout.
+            # Intermittent, and it would surface during a scarce robot slot.
+            self.executor_node = Node("pragmabot_executor")
+            self.executor = PandaSkillExecutor(self.executor_node)
 
         self.start_gradio_interface()
 
@@ -526,6 +535,8 @@ def main(args=None):
         if pragmabot is not None:
             logger.info("Saving conversation log before shutdown...")
             pragmabot.save_conversation_log()
+            if getattr(pragmabot, "executor_node", None) is not None:
+                pragmabot.executor_node.destroy_node()
             pragmabot.node.destroy_node()
         # Guard: rclpy.shutdown() raises if the context is already down
         # (e.g. Ctrl-C already tore it down), which would mask the real
