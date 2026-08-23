@@ -27,6 +27,7 @@ import logging
 import os
 import sys
 import threading
+import time
 
 import matplotlib
 
@@ -48,6 +49,7 @@ from pragmabot.conversation_builder import ConversationBuilder
 from pragmabot.vlm_scene_describer import VLMSceneDescriber
 from pragmabot.memory_manager import MemoryManager
 from pragmabot.panda_skill_executor import PandaSkillExecutor
+from pragmabot.trial_logger import TrialLogger
 
 
 logger = logging.getLogger(__name__)
@@ -89,6 +91,15 @@ class PragmaBot:
         self.conversation_log = []
         self.display_index = 0
         self.time_step = 0
+
+        # Per-trial JSONL log, created fresh in init_task(). Distinct from
+        # conversation_log/save_conversation_log(), which stores the dialogue
+        # once at exit and none of the measurements a results table needs.
+        self.trial_log = None
+        # Retrieval similarities were previously discarded at the call site
+        # (`self.ltm, _, _, _, _ = ...`). They are the Fig. 7 ablation, so
+        # they are kept here and written into every step record.
+        self.ltm_similarities = []
 
         # Load configuration from YAML file
         self.config = get_config()
@@ -177,9 +188,19 @@ class PragmaBot:
             chatbot: Gradio chatbot component (unused, kept for callback API).
         """
         max_steps = int(getattr(self.config, "max_steps", 10))
-        for _ in range(max_steps):
-            if self._plan_one_step(chatbot):
-                return
+        try:
+            for _ in range(max_steps):
+                if self._plan_one_step(chatbot):
+                    if self.trial_log is not None:
+                        self.trial_log.finish("completed")
+                    return
+        except Exception:
+            # A crashed trial is still data - record the outcome before the
+            # exception propagates, or the run is indistinguishable from one
+            # that never started.
+            if self.trial_log is not None:
+                self.trial_log.finish("crashed")
+            raise
 
         # Recorded in STM, not just logged: an abort is a real outcome the
         # experience summarizer should see, and "ran out of steps" is a
@@ -187,6 +208,8 @@ class PragmaBot:
         msg = f"Task aborted: reached max_steps={max_steps} without completion."
         self.logger.warn(msg)
         self.append_to_stm_if_activated("additional_info", msg)
+        if self.trial_log is not None:
+            self.trial_log.finish("max_steps", notes=msg)
 
     def _plan_one_step(self, chatbot) -> bool:
         """Run exactly one plan -> execute -> evaluate step.
@@ -213,22 +236,36 @@ class PragmaBot:
         if self.config.activate_ltm:
             # Retrieve long-term memory if activated and not already retrieved for this task
             if len(self.ltm) == 0:
-                self.ltm, _, _, _, _ = self.memory_manager.retrieve_relevant_experiences(
+                # Keep the similarities: they are what the retrieval ablation
+                # (paper Fig. 7) is computed from, and they cannot be
+                # reconstructed after the run.
+                self.ltm, self.ltm_similarities, _, _, _ = self.memory_manager.retrieve_relevant_experiences(
                     self.instruction,
                     self.initial_scene_description,
                     self.config.retrieval_top_k,
                     self.config.use_random_retrieval,
                 )
 
+        plan_t0 = time.time()
         next_action, _, _ = self.task_planner.plan_action(self.instruction, self.color_image, self.stm, self.ltm)
+        plan_latency_s = time.time() - plan_t0
         self.append_to_stm_if_activated("action", next_action)
         self.action_taken = next_action.chosen_action
+
+        # Log the planning decision BEFORE execution, so a crash during the
+        # robot motion still leaves the planner's reasoning on disk.
+        self._log_step(next_action, latency_s=plan_latency_s)
 
         if self.config.rosbag_replay:
             # Send a request for success detection if no action execution
             return self.handle_evaluation_request(chatbot)
 
         exec_result = self.executor.execute(next_action)
+        self._log_step(
+            next_action,
+            exec_success=bool(exec_result.get("success", False)),
+            exec_message=str(exec_result.get("message", "")),
+        )
         if not exec_result.get("success", False):
             # f-string, not %s-with-arg: rclpy's logger takes a single
             # pre-formatted string and does NOT do rospy's lazy
@@ -243,6 +280,25 @@ class PragmaBot:
                 f"Skill execution failed: {exec_result.get('message', '')}",
             )
         return self.handle_evaluation_request(chatbot)
+
+    def _log_step(self, action, **fields) -> None:
+        """Write one step record. Never raises - logging must not abort a trial."""
+        if self.trial_log is None:
+            return
+        try:
+            self.trial_log.log_step(
+                time_step=self.time_step,
+                chosen_skill=getattr(action, "chosen_skill", None),
+                target_object=getattr(action, "target_object", "") or "",
+                placement_object=getattr(action, "placement_object", "") or "",
+                chain_of_thought_reasoning=getattr(action, "chain_of_thought_reasoning", "") or "",
+                ltm_retrieved_scenarios=list(self.ltm),
+                ltm_similarities=list(self.ltm_similarities),
+                stm_len_chars=len(str(self.stm)),
+                **fields,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warn(f"trial logging failed (continuing): {exc}")
 
     def handle_evaluation_request(self, chatbot) -> bool:
         """Evaluate action success by comparing before/after observations.
@@ -277,6 +333,21 @@ class PragmaBot:
             self.color_image,
         )
         self.append_to_stm_if_activated("evaluation", success_evaluation)
+
+        # The VLM's own verdict. Paired with a human label (see the UI's
+        # ground-truth control) this is what the success detector's
+        # false-positive / false-negative rates are computed from - the
+        # paper reports 5% FP and 6.67% FN, and a confusion matrix cannot be
+        # reconstructed after the fact.
+        if self.trial_log is not None:
+            try:
+                self.trial_log.log_step(
+                    time_step=self.time_step,
+                    vlm_is_action_successful=bool(success_evaluation.is_action_successful),
+                    vlm_is_task_completed=bool(success_evaluation.is_task_completed),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warn(f"trial logging failed (continuing): {exc}")
 
         if success_evaluation.is_task_completed:
             if self.config.save_to_ltm:
@@ -403,6 +474,22 @@ class PragmaBot:
             init_task(chatbot)
             self.conversation_log.append({"role": "user", "content": f"# Instruction: {user_instruction}"})
             self.instruction = user_instruction
+            # Opened here, not in init_task(): the trial log is keyed by the
+            # instruction, which init_task() has just cleared to None.
+            self.trial_log = TrialLogger(
+                self.log_folder,
+                user_instruction,
+                config={
+                    "vlm_model": self.config.vlm.vlm_model,
+                    "text_embedding_model": self.config.vlm.text_embedding_model,
+                    "activate_stm": self.config.activate_stm,
+                    "activate_ltm": self.config.activate_ltm,
+                    "retrieval_top_k": self.config.retrieval_top_k,
+                    "use_random_retrieval": self.config.use_random_retrieval,
+                    "max_steps": getattr(self.config, "max_steps", 10),
+                    "rosbag_replay": self.config.rosbag_replay,
+                },
+            )
             # The gui is updated immediately after this function returns. So the display_index should be updated here.
             self.display_index = len(self.conversation_log)
             return "", self.conversation_log
