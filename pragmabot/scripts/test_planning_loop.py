@@ -85,6 +85,10 @@ class FakeBot:
         self.logger = _Logger()
         self.calls = 0
         self.stm_notes = []
+        # None is the genuine "no trial log" state (rosbag replay, or a run
+        # started before an instruction was set), so this also checks that
+        # handle_planning_request stays safe without one.
+        self.trial_log = None
 
     def _plan_one_step(self, chatbot):
         self.calls += 1
