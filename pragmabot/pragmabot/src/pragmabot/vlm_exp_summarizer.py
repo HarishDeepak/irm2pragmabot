@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # --- Prompt Templates ---
 
 EXPERIENCE_SYSTEM_PROMPT = """
-You are a helpful assistant for a legged robot equipped with a single arm and a two-finger gripper. You specialize in summarizing the robot's experiences and extracting generalizable lessons learned. You always apply chain-of-thought reasoning to thoroughly analyze each situation before performing the conversion.
+You are a helpful assistant for a fixed-base 7-DoF robot arm with a two-finger gripper, mounted at the edge of a table. You specialize in summarizing the robot's experiences and extracting generalizable lessons learned. You always apply chain-of-thought reasoning to thoroughly analyze each situation before performing the conversion.
 """
 
 EXPERIENCE_TASK_PROMPT = """

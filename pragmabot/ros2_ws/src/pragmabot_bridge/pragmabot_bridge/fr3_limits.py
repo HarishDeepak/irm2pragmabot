@@ -148,7 +148,7 @@ class FR3Limits:
                 continue
             r, w, p, c = self.velocity_headroom(names, pt.positions, pt.velocities)
             if r > worst:
-                worst, who, perm, cmd, idx = r, w, p, c
+                worst, who, perm, cmd, idx = r, w, p, c, i
                 at_q = pt.positions[names.index(w)] if w in names else 0.0
 
         if worst <= safety:

@@ -59,6 +59,46 @@ def select_topdown_index(grasps_T_base: np.ndarray) -> int:
     return int(np.argmin(approach_axis[:, 2]))
 
 
+def select_grasp_index(grasps_T_base: np.ndarray, confidences=None,
+                       min_confidence: float = 0.0) -> int:
+    """Best grasp by GraspGen confidence AND top-down alignment.
+
+    WHY NOT select_topdown_index. That function takes argmin over the
+    approach axis alone, so out of 100 candidates spanning conf 0.66-0.95 it
+    returns whichever points straightest down - even if it is the WORST
+    grasp GraspGen scored. Geometry was being used to overrule the model's
+    own judgement about whether the gripper actually fits the object there.
+
+    Top-down still matters (a side approach on a table risks the fingers
+    hitting the surface), so it stays in the score rather than being
+    dropped: alignment maps straight-down to 1.0, horizontal to 0.5, and
+    upward to 0.0, and multiplies the confidence. A confident near-vertical
+    grasp beats a marginal perfectly-vertical one.
+
+    `min_confidence` discards candidates outright; if that would empty the
+    set the threshold is ignored rather than failing the pick, since a low
+    confidence grasp attempted is more informative than no attempt.
+    """
+    approach_axis = grasps_T_base[:, :3, :3] @ np.array([0.0, 0.0, 1.0])
+    alignment = (1.0 - approach_axis[:, 2]) / 2.0
+
+    if confidences is None:
+        return int(np.argmax(alignment))
+
+    conf = np.asarray(confidences, dtype=np.float64).reshape(-1)
+    if len(conf) != len(grasps_T_base):
+        raise ValueError(
+            f"{len(conf)} confidences for {len(grasps_T_base)} grasps"
+        )
+
+    score = conf * alignment
+    if min_confidence > 0.0:
+        keep = conf >= min_confidence
+        if keep.any():
+            score = np.where(keep, score, -1.0)
+    return int(np.argmax(score))
+
+
 def standoff_pose(grasp_T_cam: np.ndarray, offset_m: float) -> np.ndarray:
     """Pre-grasp pose: same orientation as the grasp, translated back
     `offset_m` along the grasp frame's own +Z (GraspGen's approach axis),

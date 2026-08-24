@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 # --- Prompt Templates ---
 
 PLANNER_SYSTEM_PROMPT = """
-You are a helpful assistant for a legged robot equipped with a single arm and a two-finger gripper. You specialize in task planning, and you always suggest the plan that is most likely to fulfill the task. You learn and adapt from previous experience in the long-term memory and also the current short-term memory (especially the action failures). Always apply chain-of-thought reasoning by thinking step by step before making a final decision.
+You are a helpful assistant for a fixed-base 7-DoF robot arm with a two-finger gripper, mounted at the edge of a table. You specialize in task planning, and you always suggest the plan that is most likely to fulfill the task. You learn and adapt from previous experience in the long-term memory and also the current short-term memory (especially the action failures). Always apply chain-of-thought reasoning by thinking step by step before making a final decision.
 """
 
 PLANNER_TASK_PROMPT = """
@@ -28,12 +28,11 @@ PLANNER_INSTRUCTION_PROMPT = """
 Given the current scene and task, choose the next best action.
 
 HARD CONSTRAINTS TO APPLY:
-  - PUSH only works on objects directly on the table (nothing can be between the object and the table). PICK and PLACE would also work.
-  - If the objective is to put an object on top of another object, you must use PICK and PLACE. PUSH would not work. Similarly, you cannot PUSH an object off another object because it is not directly on the table.
-  - When two objects are next to each other, it's infeasible to directly PUSH the object that is behind the other one.
+  - PUSH IS NOT AVAILABLE on this robot. Only PICK and PLACE are implemented. Never choose PUSH: it will be rejected without moving the arm and the step will be wasted.
+  - If the objective is to put an object on top of another object, use PICK and PLACE.
   - If the robot is holding something, it must PLACE that object before attempting to grasp another.
   - When the target object is tiny or flat, which is hard to grasp, you cannot use PICK.
-  - In the case of action failure, never repeat the same action immediately without first rearranging the scene yourself. This is because the same failure is mostly likely to occur, whether the scene has been reset or not. Instead, consider whether other actions could be taken.
+  - In the case of action failure, first read the failure message. If it describes a hardware, perception or software fault (a server or node not running, a timeout, a limit violation, 'not implemented'), the action itself was never carried out: retrying the SAME action is correct once the fault is cleared, and changing your grasp strategy would be reasoning about a physical failure that never happened. Only if the message shows the action genuinely executed and did not achieve its goal should you avoid repeating it without first rearranging the scene.
   - Never give a suggestion on how to better execute a failed action—the robot cannot understand or adapt to such advice.
   
 GENERAL RULES:
@@ -44,7 +43,6 @@ GENERAL RULES:
 ACTION PARAMETERS:
   - For the pick up, if the object needs to be grasped at a specific section, you must specify that as well.
   - For the place action, you need to specify which object to place the target object on (not next to). If the object needs to be placed at a specific section, you must specify that as well.
-  - For the push action, you need to specify the direction to push (left or right). When both push directions work, prefer pushing left if the object is on the left to the gripper; right if on the right.
 
 Output your final decision in the specified structured format. A human operator may have reset the scene to its initial state after the failure.
 """

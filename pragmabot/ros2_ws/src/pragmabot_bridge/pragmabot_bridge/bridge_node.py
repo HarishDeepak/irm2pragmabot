@@ -106,6 +106,8 @@ from std_msgs.msg import Header
 from tf2_ros import Buffer, TransformListener
 
 from pragmabot_bridge import grasp_transform
+from pragmabot_bridge.cartesian_path import cartesian_step_schedule
+from pragmabot_bridge.fr3_limits import FR3Limits
 
 
 class PragmabotBridge(Node):
@@ -157,6 +159,18 @@ class PragmabotBridge(Node):
         # tests can substitute a canned frame.
         self._scene_source = self._capture_scene
 
+        # Read once: franka_description's joint_limits.yaml if present,
+        # else the fallback table baked into fr3_limits.py.
+        self._limits = FR3Limits.load()
+
+        # The most recent failure reason from a skill. The action result used
+        # to say only "see the node log", so the planner never learned WHY a
+        # pick failed and invented physical explanations for what were
+        # actually crashed ROS nodes - it reasoned about gripper span and cup
+        # geometry while the real cause was `Action servers: 0`. Self-
+        # reflection on a wrong cause is worse than none.
+        self._last_failure = ""
+
         # grasp_file is now a FALLBACK, used only when use_live_perception
         # is false. Live perception resolves the planner's target_object
         # per pick; the parameter is kept so offline replay against a saved
@@ -183,6 +197,45 @@ class PragmabotBridge(Node):
         self.declare_parameter("object_pcd_file", "")
         self.declare_parameter("grasp_index", -1)
         self.declare_parameter("revolute_jump_threshold", 0.2)
+
+        # --- straight-line (Cartesian) path quality ---------------------
+        # eef_step: the Cartesian distance between successive IK samples
+        # along the straight line. Smaller means the line is followed more
+        # tightly and each step asks less of the IK solver, at the cost of
+        # more samples. 1cm is the starting value; a failed plan is retried
+        # with progressively finer steps down to cartesian_min_step.
+        self.declare_parameter("cartesian_max_step", 0.01)
+        self.declare_parameter("cartesian_min_step", 0.001)
+        self.declare_parameter("cartesian_max_tries", 5)
+
+        # --- FR3 position-dependent velocity limit -----------------------
+        # Every trajectory is checked against the real limit before it is
+        # sent, and slowed down if it would violate it. See fr3_limits.py
+        # for why MoveIt cannot do this itself.
+        #
+        # velocity_safety_margin: fraction of the permitted velocity we
+        # allow. libfranka rejects AT the limit, not near it, so leave
+        # headroom for the controller's own tracking error.
+        self.declare_parameter("velocity_safety_margin", 0.9)
+        self.declare_parameter("enforce_velocity_limits", True)
+        # A near-singular Cartesian segment shows up as a big joint step
+        # between waypoints only 1cm apart. GetCartesianPath accepts
+        # revolute_jump_threshold but does not forward it to the
+        # interpolator (moveit2 #2404), so the guard has to be applied
+        # here instead of trusted to the service.
+        self.declare_parameter("max_joint_jump_rad", 0.5)
+
+        # --- action call timeouts ----------------------------------------
+        # Bounds every wait in _send_goal_blocking. Without these a crashed
+        # action server (whose name lingers in the DDS graph) hangs the
+        # bridge silently instead of failing with a reason.
+        # result timeout covers the slowest legitimate call: a full MoveIt
+        # plan + execute, or a gripper homing cycle.
+        self.declare_parameter("action_server_timeout_s", 10.0)
+        # Grasps below this GraspGen confidence are skipped when a better one
+        # exists. Ignored entirely if it would leave no candidate at all.
+        self.declare_parameter("min_grasp_confidence", 0.80)
+        self.declare_parameter("action_result_timeout_s", 120.0)
         self.declare_parameter("place_after_s", 0.0)
         self.declare_parameter("gripper_open_width", 0.08)
         self.declare_parameter("home_gripper_first", True)
@@ -297,7 +350,7 @@ class PragmabotBridge(Node):
         homed this session and want faster iteration.
         """
         if home_gripper_first and not self._home_gripper():
-            self.get_logger().error(
+            self._fail_log(
                 "Gripper homing failed - Desk likely still shows the end "
                 "effector as not connected/faulted. Check Desk directly "
                 "before retrying; nothing past this point will work."
@@ -313,18 +366,41 @@ class PragmabotBridge(Node):
             )
             T_base_from_cam = grasp_transform.transform_to_matrix(stamped)
         except Exception as exc:  # noqa: BLE001 - report and abort, don't guess
-            self.get_logger().error(f"TF lookup fr3_link0 <- {camera_frame} failed: {exc}")
+            self._fail_log(f"TF lookup fr3_link0 <- {camera_frame} failed: {exc}")
             return False
         grasps_T_base = T_base_from_cam @ grasps_T_cam
 
         if grasp_index < 0:
-            grasp_index = grasp_transform.select_topdown_index(grasps_T_base)
-            self.get_logger().info(
-                f"Auto-selected grasp index {grasp_index}/{len(grasps_T_cam)} "
-                "as the most top-down candidate"
+            # GraspGen's own confidences travel in the same npz. Selecting on
+            # geometry alone let a 0.66-confidence grasp win over a 0.95 one
+            # purely for being a few degrees more vertical.
+            confidences = None
+            try:
+                with np.load(grasp_file) as _npz:
+                    if "confidences" in _npz:
+                        confidences = _npz["confidences"]
+            except Exception as exc:  # noqa: BLE001 - fall back to geometry only
+                self.get_logger().warn(
+                    f"Could not read confidences from {grasp_file}: {exc} - "
+                    "selecting on top-down alignment alone"
+                )
+            grasp_index = grasp_transform.select_grasp_index(
+                grasps_T_base, confidences,
+                min_confidence=float(self.get_parameter("min_grasp_confidence").value),
             )
+            if confidences is not None:
+                self.get_logger().info(
+                    f"Auto-selected grasp {grasp_index}/{len(grasps_T_cam)} "
+                    f"(confidence {confidences[grasp_index]:.3f}, best available "
+                    f"{np.max(confidences):.3f}) by confidence x top-down alignment"
+                )
+            else:
+                self.get_logger().info(
+                    f"Auto-selected grasp index {grasp_index}/{len(grasps_T_cam)} "
+                    "as the most top-down candidate (no confidences available)"
+                )
         elif grasp_index >= len(grasps_T_cam):
-            self.get_logger().error(
+            self._fail_log(
                 f"grasp_index={grasp_index} out of range (grasp_file has "
                 f"{len(grasps_T_cam)} grasps) - aborting"
             )
@@ -354,7 +430,7 @@ class PragmabotBridge(Node):
         # Step 1: MoveGroup to the pre-grasp standoff.
         standoff_pose_msg = grasp_transform.matrix_to_pose(standoff_T_base)
         if not self._move_to_pose(group_name, eef_link, standoff_pose_msg):
-            self.get_logger().error("Failed to reach standoff pose - aborting")
+            self._fail_log("Failed to reach standoff pose - aborting")
             return False
 
         # Step 2: straight-line Cartesian approach into the grasp pose.
@@ -362,17 +438,19 @@ class PragmabotBridge(Node):
         cart = self._compute_cartesian_path(group_name, eef_link, [grasp_pose_msg])
         if cart is None or cart.fraction < 1.0:
             frac = None if cart is None else cart.fraction
-            self.get_logger().error(
+            self._fail_log(
                 f"Cartesian approach incomplete (fraction={frac}) - aborting. "
-                "A fraction well below 1.0 (rather than exactly 0.0 from a "
-                "service failure) usually means revolute_jump_threshold "
-                "truncated the path due to a large single-joint jump "
-                "between steps - a likely sign the straight-line approach "
-                "passes near a singularity for this grasp pose."
+                "This is already after refining max_step down to "
+                "cartesian_min_step, so it is not a discretisation problem: "
+                "a fraction well below 1.0 (rather than exactly 0.0 from a "
+                "service failure) means IK could not solve an increment even "
+                "at the finest step - the straight-line approach genuinely "
+                "leaves the reachable workspace or passes near a singularity "
+                "for this grasp pose. Pick a different grasp candidate."
             )
             return False
         if not self._execute_trajectory(cart.solution):
-            self.get_logger().error("Cartesian approach execution failed - aborting")
+            self._fail_log("Cartesian approach execution failed - aborting")
             return False
 
         # Step 3: close the gripper. One retry after re-homing, since a
@@ -384,7 +462,7 @@ class PragmabotBridge(Node):
             if not self._home_gripper() or not self._grasp(
                 gripper_width, gripper_speed, gripper_force, gripper_epsilon
             ):
-                self.get_logger().error("Gripper grasp failed after retry - aborting retreat")
+                self._fail_log("Gripper grasp failed after retry - aborting retreat")
                 return False
 
         # Step 4: straight-line lift along fr3_link0's own +Z (not the
@@ -396,10 +474,10 @@ class PragmabotBridge(Node):
         cart = self._compute_cartesian_path(group_name, eef_link, [retreat_pose_msg])
         if cart is None or cart.fraction < 1.0:
             frac = None if cart is None else cart.fraction
-            self.get_logger().error(f"Retreat path incomplete (fraction={frac})")
+            self._fail_log(f"Retreat path incomplete (fraction={frac})")
             return False
         if not self._execute_trajectory(cart.solution):
-            self.get_logger().error("Retreat execution failed")
+            self._fail_log("Retreat execution failed")
             return False
 
         self.get_logger().info("Pick sequence complete")
@@ -416,26 +494,26 @@ class PragmabotBridge(Node):
             cart = self._compute_cartesian_path(group_name, eef_link, [grasp_pose_msg])
             if cart is None or cart.fraction < 1.0:
                 frac = None if cart is None else cart.fraction
-                self.get_logger().error(f"Place descent incomplete (fraction={frac})")
+                self._fail_log(f"Place descent incomplete (fraction={frac})")
                 return False
             if not self._execute_trajectory(cart.solution):
-                self.get_logger().error("Place descent execution failed")
+                self._fail_log("Place descent execution failed")
                 return False
 
             # Step 6: open the gripper to release - Move, not Grasp, since
             # no object-contact force is expected on release.
             if not self._open_gripper(gripper_open_width, gripper_speed):
-                self.get_logger().error("Gripper open (place) failed")
+                self._fail_log("Gripper open (place) failed")
                 return False
 
             # Step 7: retreat again, same as step 4.
             cart = self._compute_cartesian_path(group_name, eef_link, [retreat_pose_msg])
             if cart is None or cart.fraction < 1.0:
                 frac = None if cart is None else cart.fraction
-                self.get_logger().error(f"Post-place retreat incomplete (fraction={frac})")
+                self._fail_log(f"Post-place retreat incomplete (fraction={frac})")
                 return False
             if not self._execute_trajectory(cart.solution):
-                self.get_logger().error("Post-place retreat execution failed")
+                self._fail_log("Post-place retreat execution failed")
                 return False
 
             self.get_logger().info("Place-back-in-place sequence complete")
@@ -808,6 +886,9 @@ class PragmabotBridge(Node):
         """
         request = goal_handle.request
         skill = request.chosen_skill.lower()
+        # Clear per goal: a reason left over from the previous skill would be
+        # reported as this one's cause, which is worse than saying nothing.
+        self._last_failure = ""
         self.get_logger().info(
             f"ExecuteSkill goal: skill={skill!r} target={request.target_object!r} "
             f"placement={request.placement_object!r}"
@@ -862,7 +943,7 @@ class PragmabotBridge(Node):
                     result.message = (
                         f"picked {request.target_object}"
                         if ok
-                        else "pick failed - see the node log for the failing step"
+                        else (self._last_failure or "pick failed for an unrecorded reason")
                     )
 
             elif skill == "place":
@@ -979,14 +1060,43 @@ class PragmabotBridge(Node):
         return ok
 
     def _compute_cartesian_path(self, group_name: str, link_name: str, waypoints: list[Pose]):
-        request = GetCartesianPath.Request()
-        request.header.frame_id = "fr3_link0"
-        request.header.stamp = self.get_clock().now().to_msg()
-        request.group_name = group_name
-        request.link_name = link_name
-        request.waypoints = waypoints
-        request.max_step = 0.01
-        request.avoid_collisions = True
+        """Plan a straight line through `waypoints`, refining the step on failure.
+
+        WHY A LOOP, AND WHY IT CHANGES THE REQUEST EACH TIME
+        ----------------------------------------------------
+        /compute_cartesian_path is DETERMINISTIC - unlike OMPL, it runs no
+        randomised sampling. Calling it again with an identical request
+        returns an identical fraction, so the usual "retry N times and hope"
+        loop is N times the wait for the same answer. Each retry here
+        therefore HALVES max_step (the eef_step) instead of repeating.
+
+        That is a real second chance, not a re-roll. The service walks the
+        line in max_step increments and IK-solves each one, seeding each
+        solve from the previous solution; it truncates at the first
+        increment it cannot solve. A smaller step is a smaller extrapolation
+        from a known-good seed, so increments that failed at 1cm are often
+        solvable at 5mm or 2.5mm - a finer discretisation of the SAME
+        straight line finds a continuous joint path where the coarse one hit
+        a wall.
+
+        Note that revolute_jump_threshold is NOT what truncates here: the
+        service accepts the field but does not forward it to the
+        interpolator (moveit2 #2404). That is why the jump guard is applied
+        client-side in _execute_trajectory instead of being trusted to the
+        request.
+
+        The straight line itself never changes. Only how finely it is
+        sampled does, so a plan accepted at 1mm is the same motion the 1cm
+        attempt was asking for - it is not a detour bought by relaxing a
+        safety check.
+
+        Returns the best result obtained (highest `fraction`), or None if
+        the service call itself failed. Callers still enforce
+        `fraction >= 1.0`; this only stops them failing over a step size.
+        """
+        max_step = float(self.get_parameter("cartesian_max_step").value)
+        min_step = float(self.get_parameter("cartesian_min_step").value)
+        max_tries = int(self.get_parameter("cartesian_max_tries").value)
         # Truncate the path (rather than execute through it) if any single
         # max_step-sized Cartesian step would require an unusually large
         # single-joint angle change -- the direct symptom of the IK
@@ -995,14 +1105,136 @@ class PragmabotBridge(Node):
         # tuned for this robot/workspace -- loosen or tighten via the
         # revolute_jump_threshold parameter if it aborts on fine motions
         # or doesn't catch a real one.
-        request.revolute_jump_threshold = self.get_parameter("revolute_jump_threshold").value
+        #
+        # NOTE: 0.0 does NOT mean "disallow jumps". In MoveIt it means
+        # "disable the check entirely", so every jump is accepted and the
+        # arm may flip a joint mid-line at full planned speed. Leave this
+        # positive on hardware.
+        jump = float(self.get_parameter("revolute_jump_threshold").value)
+        if jump <= 0.0:
+            self.get_logger().warn(
+                "revolute_jump_threshold=0.0 DISABLES the joint-jump check "
+                "- near-singular flips will be accepted, not rejected."
+            )
 
         self._cartesian_client.wait_for_service()
-        future = self._cartesian_client.call_async(request)
-        rclpy.spin_until_future_complete(self, future)
-        return future.result()
+
+        schedule = cartesian_step_schedule(max_step, min_step, max_tries)
+        best = None
+        for attempt, max_step in enumerate(schedule, start=1):
+            request = GetCartesianPath.Request()
+            request.header.frame_id = "fr3_link0"
+            request.header.stamp = self.get_clock().now().to_msg()
+            request.group_name = group_name
+            request.link_name = link_name
+            request.waypoints = waypoints
+            request.max_step = max_step
+            request.avoid_collisions = True
+            request.revolute_jump_threshold = jump
+
+            future = self._cartesian_client.call_async(request)
+            rclpy.spin_until_future_complete(self, future)
+            result = future.result()
+
+            if result is None:
+                self.get_logger().error(
+                    "/compute_cartesian_path service call failed on attempt "
+                    f"{attempt} (max_step={max_step:.4f} m)"
+                )
+                return best
+
+            if best is None or result.fraction > best.fraction:
+                best = result
+
+            if result.fraction >= 1.0:
+                if attempt > 1:
+                    self.get_logger().info(
+                        f"Cartesian path complete on attempt {attempt} after "
+                        f"refining max_step to {max_step:.4f} m"
+                    )
+                return result
+
+            if attempt == len(schedule):
+                break
+
+            self.get_logger().warn(
+                f"Cartesian path incomplete (fraction={result.fraction:.3f}) at "
+                f"max_step={max_step:.4f} m - retrying with a finer step"
+            )
+
+        self.get_logger().error(
+            f"Cartesian path incomplete after {len(schedule)} attempt(s), finest "
+            f"step {schedule[-1]:.4f} m (best fraction={best.fraction:.3f}). "
+            "Refining further will not help: either the jump threshold is "
+            "truncating on a persistent near-singular joint flip, or the "
+            "straight line is genuinely unreachable - goal out of range, "
+            "blocked by a collision object, or the arm needs a different "
+            "starting configuration."
+        )
+        return best
 
     def _execute_trajectory(self, robot_trajectory) -> bool:
+        """Vet a trajectory against the real FR3 limits, then execute it.
+
+        THE GAP THIS CLOSES
+        -------------------
+        MoveIt hands back a trajectory timed against the URDF's CONSTANT
+        velocity limit. The FR3's actual limit shrinks as a joint nears its
+        position limit, and a URDF cannot express that, so the planner is
+        structurally blind to it: it will happily return a trajectory that
+        libfranka then refuses at 1 kHz with "speed limits reached", after
+        the arm has already started moving.
+
+        This is the last point before the trajectory leaves our process, so
+        it is the only place the check can be made once and cover every
+        motion - free-space and Cartesian alike.
+
+        Slowing down is EXACT, not a heuristic: re-timing is a
+        reparameterisation of the same geometric path, so no waypoint moves
+        and a collision-free path stays collision-free (see
+        grasp_transform.retime_trajectory). What re-timing cannot fix is a
+        configuration so close to a limit that no speed is legal - there
+        the answer is a different grasp, and this refuses rather than
+        moving.
+        """
+        jt = robot_trajectory.joint_trajectory
+
+        if self.get_parameter("enforce_velocity_limits").value:
+            safety = float(self.get_parameter("velocity_safety_margin").value)
+
+            jump = grasp_transform.max_joint_jump(jt)
+            jump_max = float(self.get_parameter("max_joint_jump_rad").value)
+            if jump > jump_max:
+                self.get_logger().error(
+                    f"Refusing to execute: largest single-joint step between "
+                    f"consecutive waypoints is {jump:.3f} rad, above the "
+                    f"{jump_max:.3f} rad guard. Two waypoints ~1cm apart in "
+                    "Cartesian space needing that much joint motion is the "
+                    "signature of a near-singular configuration - the arm "
+                    "would flip through it at speed. Pick a different grasp."
+                )
+                return False
+
+            ok, reason, _ = self._limits.check_trajectory(jt, safety)
+            if not ok:
+                factor = self._limits.retime_factor_for(jt, safety)
+                if factor is None:
+                    self.get_logger().error(f"Refusing to execute: {reason}")
+                    return False
+                self.get_logger().warn(
+                    f"{reason} - slowing the trajectory to {factor * 100:.0f}% "
+                    "of its planned speed. The path is unchanged; only its "
+                    "timing is."
+                )
+                grasp_transform.retime_trajectory(jt, factor)
+
+                ok, reason, _ = self._limits.check_trajectory(jt, safety)
+                if not ok:
+                    self.get_logger().error(
+                        f"Refusing to execute: still illegal after re-timing - {reason}"
+                    )
+                    return False
+
         goal = ExecuteTrajectory.Goal()
         goal.trajectory = robot_trajectory
         result = self._send_goal_blocking(self._execute_client, goal, "ExecuteTrajectory")
@@ -1046,16 +1278,78 @@ class PragmabotBridge(Node):
             return False
         return True
 
+    def _fail_log(self, reason: str) -> None:
+        """Log an error AND retain it as the reason the current skill failed.
+
+        Everything in the pick path reports through here so the action result
+        can carry the real cause back to the planner.
+        """
+        self._last_failure = reason
+        self.get_logger().error(reason)
+
     def _send_goal_blocking(self, client: ActionClient, goal_msg, name: str):
-        client.wait_for_server()
+        """Send an action goal and wait for its result, bounded at every step.
+
+        WHY THE TIMEOUTS ARE NOT OPTIONAL
+        ---------------------------------
+        Every wait here used to be unbounded, and a dead action server is
+        indistinguishable from a slow one when you are blocked forever. It
+        happened: the User Stop was pressed, libfranka dropped the gripper
+        connection, franka_gripper_node crashed on a Poco NetException - and
+        its action names stayed advertised in the DDS graph afterwards. The
+        bridge sent a homing goal to `Action servers: 0`, and simply stopped,
+        with no error, no feedback and no arm motion. Diagnosing that from
+        outside took ten minutes; a timeout would have printed one line.
+
+        Note that `wait_for_server()` returning True is NOT proof the server
+        is alive - stale discovery outlives the process. The result timeout
+        is the check that actually holds.
+
+        On a result timeout the goal is cancelled rather than abandoned: if
+        the server is merely slow the arm is still moving, and walking away
+        from a live goal is how you get an unattended trajectory.
+        """
+        server_timeout = float(self.get_parameter("action_server_timeout_s").value)
+        result_timeout = float(self.get_parameter("action_result_timeout_s").value)
+
+        if not client.wait_for_server(timeout_sec=server_timeout):
+            self.get_logger().error(
+                f"{name} action server did not appear within {server_timeout:.0f}s - "
+                "it is not running, or it died and left its name in the graph. "
+                "Check `ros2 action info <action>` reports Action servers: 1."
+            )
+            return None
+
         send_future = client.send_goal_async(goal_msg)
-        rclpy.spin_until_future_complete(self, send_future)
+        rclpy.spin_until_future_complete(self, send_future, timeout_sec=server_timeout)
+        if not send_future.done():
+            self.get_logger().error(
+                f"{name} did not acknowledge the goal within {server_timeout:.0f}s - "
+                "the server is advertised but not responding (most likely it "
+                "crashed while its action names are still discoverable)."
+            )
+            return None
+
         goal_handle = send_future.result()
         if goal_handle is None or not goal_handle.accepted:
             self.get_logger().error(f"{name} goal rejected")
             return None
+
         result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
+        rclpy.spin_until_future_complete(self, result_future, timeout_sec=result_timeout)
+        if not result_future.done():
+            self.get_logger().error(
+                f"{name} returned no result within {result_timeout:.0f}s - "
+                "cancelling the goal. If the robot is in User Stop, release it "
+                "and check Desk before retrying."
+            )
+            try:
+                cancel_future = goal_handle.cancel_goal_async()
+                rclpy.spin_until_future_complete(self, cancel_future, timeout_sec=5.0)
+            except Exception as exc:  # noqa: BLE001 - already failing; report and move on
+                self.get_logger().warn(f"{name} cancel request failed: {exc}")
+            return None
+
         return result_future.result()
 
 

@@ -1,4 +1,4 @@
-rosbag_replay: true
+rosbag_replay: false
 gradio_share: false
 
 # Hard cap on planning steps per task. Both a safety valve (an uncapped VLM
@@ -10,8 +10,8 @@ max_steps: 10
 
 # --- Memory Settings ---
 activate_stm: true
-activate_ltm: true
-save_to_ltm: true
+activate_ltm: false
+save_to_ltm: false
 use_random_retrieval: false
 retrieval_top_k: 5  # -1 for everything (unsorted)
 

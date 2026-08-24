@@ -1,4 +1,46 @@
-> Note: an earlier, longer version of these notes is kept at `LAB_README_ARCHIVE.md` (376 lines) — it has calibration results and open items that were trimmed from this file.
+# Lab README — raw command notes
+
+> **Start here instead for anything operational:**
+> - **`RUNBOOK.md`** — the full pipeline, in order, with the check after each step.
+>   Use this to bring the robot up. It supersedes the loose commands below.
+> - **`HANDOFF_2026-08-24_EVENING.md`** — current project state, what changed,
+>   what is broken, what is open.
+> - `extras/HANDOFF_2026-08-24.md` — the earlier handoff (calibration facts,
+>   protected-module rule).
+> - `LAB_README_ARCHIVE.md` — the longer earlier version of this file (376 lines),
+>   kept for the FoundationPose calibration results.
+>
+> This file stays as the raw scratch log of commands actually typed at the lab.
+> Three things in it are now out of date — corrected here rather than edited
+> away, since the history is useful:
+>
+> 1. **`export ROS_DOMAIN_ID=7` is now automatic.** It is in `~/.bashrc`, along
+>    with sourcing `/opt/ros/humble` and `~/zed_ros2_ws/install`. Every new host
+>    terminal is ready. The "we should add ..." note below is done.
+> 2. **Use `~/zed_ros2_ws`, never `~/irm2pragmabot/zed_ros2_ws`.** The copy inside
+>    the repo is source-only with no `install/` and is never built. `ros2 launch`
+>    resolves packages by name, not by working directory, so the folder you stand
+>    in has never mattered — only what is sourced. Same trap applies to the
+>    vendored `ros2_ws/franka_ros2`, `GraspGen/` and `groundedsam/` in the repo,
+>    each of which now carries a `NOT_THE_BUILT_COPY.md`.
+> 3. **The published calibration TF was wrong by 15.7 mm in Z** (2026-08-24).
+>    The measurement was fine; the composition to `zed_camera_link` was done from
+>    `tf2_echo`'s 3-decimal output. Recomputed at full precision and written to
+>    `~/.ros2/easy_handeye2/calibrations/fr3_zed_right.calib`
+>    (backup `.bak-precision-2119`). It only takes effect after the robot stack is
+>    relaunched, since `/handeye_publisher` reads the file at startup.
+>    Verify with:
+>    ```
+>    ros2 run tf2_ros tf2_echo fr3_link0 zed_left_camera_frame_optical
+>    ```
+>    Translation should read `[0.912, -0.064, 0.514]`. If z is `0.498`, the old
+>    value is still live. Full detail in `HANDOFF_2026-08-24_EVENING.md` §4.
+>
+> Also note `docker exec` needs `-e DISPLAY=$DISPLAY` or RViz will not open — the
+> image carries a stale `DISPLAY=:2` while the real socket is `:1`. The
+> container's `~/.bashrc` now sets it too.
+
+---
 
 container franka:
 echo $ROS_DOMAIN_ID

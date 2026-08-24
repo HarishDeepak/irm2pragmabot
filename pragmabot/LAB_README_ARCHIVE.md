@@ -1,3 +1,10 @@
+> **ARCHIVE — superseded.** For current operations read `RUNBOOK.md`; for
+> current state read `HANDOFF_2026-08-24_EVENING.md`. This file is kept only for
+> the 2026-07-25/27 FoundationPose calibration results and the reasoning behind
+> them. Note its "Still open / next steps" list is from July and has been
+> overtaken; the ZED->base calibration was redone on 2026-08-19 and corrected
+> again on 2026-08-24 (see the evening handoff §4).
+
 # Lab README — Archive (full version, up to 2026-07-27)
 
 > This is the longer, earlier version of the lab notebook (376 lines).

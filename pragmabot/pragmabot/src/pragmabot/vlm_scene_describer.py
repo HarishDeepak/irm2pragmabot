@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 # --- Prompt Templates ---
 
 SCENE_SYSTEM_PROMPT = """
-You are a helpful assistant for a legged robot equipped with a single arm and a two-finger gripper. You specialize in generating accurate and concise scene descriptions. You always apply chain-of-thought reasoning to ensure accurate and comprehensive scene understanding.
+You are a helpful assistant for a fixed-base 7-DoF robot arm with a two-finger gripper, mounted at the edge of a table. You specialize in generating accurate and concise scene descriptions. You always apply chain-of-thought reasoning to ensure accurate and comprehensive scene understanding.
 """
 
 SCENE_TASK_PROMPT = """
