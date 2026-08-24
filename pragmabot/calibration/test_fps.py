@@ -7,6 +7,9 @@ detection), picks N spread-out candidate points inside the mask, and
 draws them as numbered dots on the image. Nothing else — no depth, no
 VLM, no robot.
 
+The sampler itself now lives in `mask_sampling.py` so the bridge can call
+it too; this file is its CLI and its visual check, unchanged.
+
 USAGE
 -----
     python3 test_fps.py \
@@ -14,37 +17,21 @@ USAGE
         --mask extracted/<scene>/detections/mask.npy \
         --n 8 \
         --out fps_check.png
+
+    # also mark the pixel the bridge would actually place on (green X):
+    python3 test_fps.py --rgb ... --mask ... --show-placement
 """
 
 import argparse
+import sys
+from pathlib import Path
+
 import cv2
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-def farthest_point_sampling(mask: np.ndarray, n_points: int = 8) -> np.ndarray:
-    """Select n_points spread-out pixels from a binary mask.
-    Returns an (N, 2) array of [u, v] = [col, row] pixel coordinates."""
-    ys, xs = np.nonzero(mask)
-    if len(xs) == 0:
-        raise ValueError("Mask is empty — nothing to sample from.")
-
-    n_points = min(n_points, len(xs))
-    points = np.column_stack([xs, ys]).astype(np.int32)
-
-    # start at the point closest to the mask's centroid
-    centroid = points.mean(axis=0)
-    first_idx = np.argmin(np.sum((points - centroid) ** 2, axis=1))
-
-    selected = [int(first_idx)]
-    min_dist_sq = np.sum((points - points[first_idx]) ** 2, axis=1).astype(np.float64)
-
-    for _ in range(1, n_points):
-        next_idx = int(np.argmax(min_dist_sq))
-        selected.append(next_idx)
-        new_dist_sq = np.sum((points - points[next_idx]) ** 2, axis=1)
-        min_dist_sq = np.minimum(min_dist_sq, new_dist_sq)
-
-    return points[selected]
+from mask_sampling import farthest_point_sampling, select_placement_pixel
 
 
 def draw_numbered_candidates(rgb, mask, candidate_pixels, radius=8):
@@ -74,6 +61,9 @@ def main():
                     help="path to a mask file — .npy (bool array) or .png (0/255 image)")
     ap.add_argument("--n", type=int, default=8, help="number of candidate points")
     ap.add_argument("--out", default="fps_check.png", help="output image path")
+    ap.add_argument("--show-placement", action="store_true",
+                    help="also mark the pixel select_placement_pixel() would "
+                         "choose (green X) — the one the bridge actually places on")
     args = ap.parse_args()
 
     rgb = cv2.imread(args.rgb)
@@ -96,6 +86,16 @@ def main():
         print(f"  [{i+1}] pixel (u={u}, v={v})")
 
     annotated = draw_numbered_candidates(rgb, mask, candidates)
+
+    if args.show_placement:
+        u, v, info = select_placement_pixel(mask)
+        print(f"\nplacement pixel: (u={u}, v={v}) "
+              f"{info['interior_px']} px from the mask edge "
+              f"(margin enforced {info['margin_px']} px"
+              f"{', RELAXED' if info['relaxed'] else ''})")
+        cv2.drawMarker(annotated, (u, v), (0, 255, 0), cv2.MARKER_TILTED_CROSS,
+                       28, 3, cv2.LINE_AA)
+
     cv2.imwrite(args.out, annotated)
     print(f"\nWrote {args.out}")
 

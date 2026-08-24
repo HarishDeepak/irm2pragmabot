@@ -22,10 +22,19 @@ Grounded-SAM-2 needs torch>=2.3.1):
 PROTOCOL (msgpack over ZMQ REQ/REP, one dict in, one dict out)
 
   request  {"rgb": <png bytes>, "depth": <npy bytes>, "intrinsics": {...},
-            "prompt": "red cup.", "workspace": {...}|None}
+            "prompt": "red cup.", "workspace": {...}|None,
+            "return_mask": bool}
   reply    {"ok": true,  "points": <npy bytes>, "n_points": int,
-            "confidence": float, "label": str}
+            "confidence": float, "label": str,
+            "mask": <npy bytes>}          # only when return_mask is set
            {"ok": false, "reason": "<why>"}
+
+`return_mask` exists for PLACEMENT. A placement surface is not a graspable
+object: the bridge does not want a cloud to hand to GraspGen, it wants one
+point on the surface, chosen away from the rim. That choice is made on the
+2D mask (see calibration/mask_sampling.py), so the mask has to come back.
+It is off by default — the pick path has no use for it and a 1280x720 bool
+array is ~0.9 MB per reply.
 
 `reason` is not a log line. On failure the bridge puts that string into the
 ExecuteSkill result message, which becomes an STM entry that the VLM reflects
@@ -62,6 +71,15 @@ AMBIGUITY_MARGIN = 0.15
 MIN_MASK_FRAC = 0.001   # 0.1% of the image
 MAX_MASK_FRAC = 0.40    # 40% of the image
 MIN_POINTS = 200        # below this, depth failed on the object
+
+# A PLACEMENT SURFACE is not a graspable object, and the 40% cap above is
+# wrong for it. That cap exists because a mask covering half the frame
+# means the detector latched onto the background instead of the cup. But a
+# table you place ON legitimately fills half the view - measured 51% on
+# this rig - so the object bound would refuse every real placement target.
+# Requests may raise the cap to this value instead; it still rejects a
+# degenerate mask that has swallowed the whole image.
+MAX_SURFACE_MASK_FRAC = 0.85
 
 
 class PerceptionServer:
@@ -195,11 +213,16 @@ class PerceptionServer:
 
             mask = masks[best]
             frac = float(mask.sum()) / mask.size
-            if not (MIN_MASK_FRAC <= frac <= MAX_MASK_FRAC):
+            # Callers resolving a placement SURFACE pass the looser bound;
+            # everything else keeps the object bound. Same guard, bound
+            # chosen by what is being looked for.
+            max_frac = float(req.get("max_mask_frac", MAX_MASK_FRAC))
+            min_frac = float(req.get("min_mask_frac", MIN_MASK_FRAC))
+            if not (min_frac <= frac <= max_frac):
                 return {"ok": False, "reason":
                         f"implausible mask for {labels[best]!r}: covers "
                         f"{frac * 100:.2f}% of the image (expected "
-                        f"{MIN_MASK_FRAC * 100:.1f}-{MAX_MASK_FRAC * 100:.0f}%)"}
+                        f"{min_frac * 100:.1f}-{max_frac * 100:.0f}%)"}
 
             # Same filtering the CLI applies: 3px erosion drops the flying
             # pixels at the silhouette, MAD drops one-sided depth outliers.
@@ -221,9 +244,15 @@ class PerceptionServer:
                         f"points survived filtering (need {MIN_POINTS}). The "
                         f"object may be reflective, transparent, or out of range"}
 
-            return {"ok": True, "points": _npy_dump(xyz.astype(np.float32)),
-                    "n_points": int(len(xyz)),
-                    "confidence": float(confs[best]), "label": str(labels[best])}
+            reply = {"ok": True, "points": _npy_dump(xyz.astype(np.float32)),
+                     "n_points": int(len(xyz)),
+                     "confidence": float(confs[best]), "label": str(labels[best])}
+            if req.get("return_mask"):
+                # The UNERODED mask: the caller applies its own interior
+                # margin, which for a placement surface is much larger than
+                # the 3px flying-pixel erosion used for the cloud above.
+                reply["mask"] = _npy_dump(mask)
+            return reply
 
         except Exception as exc:  # noqa: BLE001 - must never kill the server
             logger.exception("request failed")
