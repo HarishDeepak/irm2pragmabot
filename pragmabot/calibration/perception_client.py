@@ -84,9 +84,14 @@ class PerceptionClient:
             self._ctx.term()
         self._sock = self._ctx = None
 
-    def detect(self, rgb: np.ndarray, depth: np.ndarray, K: np.ndarray,
-               prompt: str, **kwargs) -> DetectionResult:
-        """Ask for the object named by `prompt`. Never raises."""
+    def detect(self, rgb: np.ndarray, depth: np.ndarray, K, prompt: str,
+               **kwargs) -> DetectionResult:
+        """Ask for the object named by `prompt`. Never raises.
+
+        `K` may be the flat dict loaded straight from intrinsics.json
+        ({"fx","fy","cx","cy"}) or a 3x3 matrix; both are normalised to the
+        dict form that mask_to_pointcloud.backproject() indexes.
+        """
         import msgpack
         import zmq
 
@@ -94,8 +99,7 @@ class PerceptionClient:
             self.connect()
 
         req = {"rgb": _npy_dump(rgb), "depth": _npy_dump(depth),
-               "intrinsics": {"K": np.asarray(K, dtype=float).ravel().tolist()},
-               "prompt": prompt}
+               "intrinsics": _as_intrinsics_dict(K), "prompt": prompt}
         req.update(kwargs)
 
         try:
@@ -119,6 +123,22 @@ class PerceptionClient:
         return DetectionResult(ok=True, points=_npy_load(rep["points"]),
                                n_points=rep["n_points"],
                                confidence=rep["confidence"], label=rep["label"])
+
+
+def _as_intrinsics_dict(K) -> dict:
+    """Normalise intrinsics to the flat dict backproject() expects.
+
+    Accepts intrinsics.json's own form (fx/fy/cx/cy, plus extra keys like
+    width/height/frame_id, which are passed through harmlessly) or a 3x3
+    matrix. Mixing the two silently is how a 3x3 ends up being indexed as
+    K["fx"] and raising IndexError deep inside back-projection.
+    """
+    if isinstance(K, dict):
+        return {k: (float(v) if isinstance(v, (int, float)) else v)
+                for k, v in K.items()}
+    m = np.asarray(K, dtype=float).reshape(3, 3)
+    return {"fx": float(m[0, 0]), "fy": float(m[1, 1]),
+            "cx": float(m[0, 2]), "cy": float(m[1, 2])}
 
 
 def _npy_dump(arr: np.ndarray) -> bytes:
@@ -150,11 +170,9 @@ def main() -> None:
     depth = np.load(args.depth)
     with open(args.intrinsics) as fh:
         intr = json.load(fh)
-    K = np.array(intr["K"], dtype=float).reshape(3, 3) if "K" in intr else np.array(
-        [[intr["fx"], 0, intr["cx"]], [0, intr["fy"], intr["cy"]], [0, 0, 1]])
 
     with PerceptionClient(args.host, args.port) as client:
-        res = client.detect(rgb, depth, K, args.prompt)
+        res = client.detect(rgb, depth, intr, args.prompt)
 
     if not res.ok:
         print(f"REFUSED: {res.reason}")

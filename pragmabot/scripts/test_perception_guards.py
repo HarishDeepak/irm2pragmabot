@@ -47,9 +47,13 @@ def _npy(arr):
 
 
 def _req(prompt="cube."):
+    # Intrinsics are the FLAT dict form, exactly as extracted/*/intrinsics.json
+    # stores them and as mask_to_pointcloud.backproject() indexes them
+    # (K["fx"], not K[0][0]).
     return {"rgb": _npy(np.zeros((720, 1280, 3), np.uint8)),
             "depth": _npy(np.full((720, 1280), 0.7, np.float32)),
-            "intrinsics": {"K": [528.604, 0, 635.405, 0, 528.604, 363.729, 0, 0, 1]},
+            "intrinsics": {"fx": 528.604, "fy": 528.604,
+                           "cx": 635.405, "cy": 363.729},
             "prompt": prompt}
 
 
@@ -122,6 +126,26 @@ def test_exception_becomes_a_reason_not_a_crash():
     ps.m2p.backproject = boom
     r = srv.handle(_req())
     assert not r["ok"] and "AABB crop removed every point" in r["reason"], r
+
+
+def test_matrix_intrinsics_refused_with_a_clear_reason():
+    """Regression: a 3x3 K raised IndexError deep inside back-projection.
+
+    Found by running the server for real on 2026-08-24. backproject()
+    indexes K as a dict; the client now normalises, and the server refuses
+    anything still missing fx/fy/cx/cy rather than failing obscurely.
+    """
+    bad = {**_req(), "intrinsics": {"K": [528.6, 0, 635.4, 0, 528.6, 363.7, 0, 0, 1]}}
+    r = _server((np.stack([_mask(0.02)]), [0.9], ["cube"])).handle(bad)
+    assert not r["ok"] and "intrinsics missing" in r["reason"], r
+    for k in ("cx", "cy", "fx", "fy"):
+        assert k in r["reason"], r["reason"]
+
+
+def test_flat_intrinsics_accepted():
+    r = _server((np.stack([_mask(0.02)]), [0.9], ["cube"]),
+                cloud=np.random.rand(900, 3).astype(np.float32)).handle(_req())
+    assert r["ok"], r
 
 
 def test_every_failure_has_a_nonempty_reason():

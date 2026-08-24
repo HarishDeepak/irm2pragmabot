@@ -33,6 +33,7 @@ phrases can be detected in one call; --select picks what goes into mask.npy.
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -43,12 +44,42 @@ import supervision as sv
 import torch
 from torchvision.ops import box_convert
 
-GROUNDED_SAM2_ROOT = Path.home() / "groundedsam" / "Grounded-SAM-2"
+def _find_grounded_sam2_root() -> Path:
+    """Locate the Grounded-SAM-2 checkout.
+
+    Was hardcoded to ~/groundedsam/Grounded-SAM-2, which is correct on the
+    lab machine (Alonnisos) and wrong everywhere else — on the laptop the
+    checkout sits beside the repo at D:/irm2pragmabot/groundedsam/. A wrong
+    path here fails at import with a bare ModuleNotFoundError for `sam2`,
+    which reads like a missing dependency rather than a wrong directory.
+
+    Order: $GROUNDED_SAM2_ROOT, then ~/groundedsam, then a sibling of the
+    repo root. First one that actually exists wins.
+    """
+    env = os.environ.get("GROUNDED_SAM2_ROOT")
+    candidates = [Path(env)] if env else []
+    candidates += [
+        Path.home() / "groundedsam" / "Grounded-SAM-2",
+        Path(__file__).resolve().parents[2] / "groundedsam" / "Grounded-SAM-2",
+    ]
+    for c in candidates:
+        if c.is_dir():
+            return c
+    # Return the first candidate so the error message names a real path.
+    return candidates[0]
+
+
+GROUNDED_SAM2_ROOT = _find_grounded_sam2_root()
 
 # grounding_dino's own inference.py does `import grounding_dino.groundingdino...`
 # (a self-reference through the repo-root directory name, not the installed
 # package name) — that only resolves if the repo root itself is on sys.path.
 sys.path.insert(0, str(GROUNDED_SAM2_ROOT))
+# ...but `import groundingdino.*` (the form used just below) resolves only if
+# the grounding_dino/ SUBDIR is also on the path. On the lab machine the
+# package is pip-installed so this is redundant; from a bare checkout it is
+# required. Harmless either way.
+sys.path.insert(0, str(GROUNDED_SAM2_ROOT / "grounding_dino"))
 
 from sam2.build_sam import build_sam2  # noqa: E402
 from sam2.sam2_image_predictor import SAM2ImagePredictor  # noqa: E402
