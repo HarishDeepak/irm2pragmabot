@@ -298,10 +298,18 @@ manual lab run exactly** — the wrapper reproduces the known-good result.
 Running it found two real bugs, both fixed (intrinsics dict-vs-matrix; the
 hardcoded `~/groundedsam` path). Guard tests now 11.
 
+**`bridge_node.py` IS NOW WIRED** (`aa35384`). Each pick resolves
+`target_object` live via `live_perception.py`; `use_live_perception:=false`
+restores the old `grasp_file` path for replay. 5 test scripts pass (31 checks).
+
 **Still NOT verified:**
-1. `bridge_node.py` is **not yet wired** to it — still reads the `grasp_file`
-   parameter, so "pick the red cup" still picks a stale npz. Remaining half of B4.
-2. Nothing has run on the **lab GPU** yet. See the laptop caveat below.
+1. **`bridge._scene_source` must be injected** — a callable returning
+   `(rgb, depth, intrinsics)`. Deliberately left None so the bridge does not
+   open a competing subscriber on the planner's BEST_EFFORT camera topics.
+   Until it is set, every pick fails with a reason (by design, not a bug).
+2. Nothing has run on the **lab GPU**, and no real pick has happened.
+3. `place` still uses the fixed `place_offset_xyz` — FPS is implemented in
+   `calibration/test_fps.py` but not called from the loop.
 
 ### Laptop vs lab — environment split (laptop-only, NOT in the repo)
 - Created `D:/irm2pragmabot/groundedsam/.venv` (torch 2.5.1+cu121,

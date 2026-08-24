@@ -281,7 +281,22 @@ after this fix, so I can name them in the report.
 ## B4. Wire perception at runtime — the biggest correctness hole
 **Robot:** ⚠ Testable offline · **Effort:** 1–2 days · **Model:** Opus 5, max
 
-> ### 🔶 HALF DONE as of 2026-08-24 (commit `d6c03aa`)
+> ### ✅ WIRED as of 2026-08-24 (commits `d6c03aa`, `ea1ad15`, `aa35384`)
+>
+> `bridge_node` now resolves `target_object` live per pick via
+> `live_perception.py` (PerceptionClient :5557 → GraspGenClient :5556).
+> `use_live_perception:=false` falls back to the old `grasp_file` for replay.
+> The perception server is verified end to end against `extracted/red_cup/`
+> (conf 0.937, 2000 pts, extent matching the earlier lab run exactly).
+>
+> **Two things still needed before a real pick:**
+> 1. **Inject `bridge._scene_source`** — a callable returning
+>    `(rgb, depth, intrinsics)`. Left None on purpose: the bridge must not
+>    open a second subscriber on the same BEST_EFFORT topics the planner's
+>    `SceneObserver` already reads. Until injected, picks fail with a reason.
+> 2. **Run both servers on the lab GPU** and do one real pick.
+>
+> Earlier notes from the first half of this task:
 >
 > **Built:** `calibration/perception_server.py` (ZMQ REP, port 5557, loads
 > SAM2+DINO once), `calibration/perception_client.py` (no torch/cv2 — safe to
