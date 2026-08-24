@@ -288,11 +288,36 @@ Append one block per working session. Newest last.
 | `d6c03aa` | ZMQ perception server/client + 9 guard tests (B4 half done) |
 | `1e927a6` | Per-trial JSONL logging (A1 done) |
 
-**Two things NOT yet verified — do not assume they work:**
-1. `perception_server.py` has **never been executed** — no GPU or groundedsam
-   venv on the laptop. Guard logic is tested; the SAM2/DINO path is not.
-2. `bridge_node.py` is **not yet wired** to it. It still reads the
-   `grasp_file` parameter, so "pick the red cup" still picks a stale npz.
+**`perception_server.py` NOW VERIFIED END TO END** (laptop, 2026-08-24, `ea1ad15`):
+```
+perception_client.py --prompt "red cup." --rgb extracted/red_cup/rgb.png ...
+  -> OK: 'red cup' conf=0.937, 2000 points, extent 9.5 x 10.7 x 7.3 cm
+```
+That **matches `extracted/red_cup/detections/object_pcd.npy` from the earlier
+manual lab run exactly** — the wrapper reproduces the known-good result.
+Running it found two real bugs, both fixed (intrinsics dict-vs-matrix; the
+hardcoded `~/groundedsam` path). Guard tests now 11.
+
+**Still NOT verified:**
+1. `bridge_node.py` is **not yet wired** to it — still reads the `grasp_file`
+   parameter, so "pick the red cup" still picks a stale npz. Remaining half of B4.
+2. Nothing has run on the **lab GPU** yet. See the laptop caveat below.
+
+### Laptop vs lab — environment split (laptop-only, NOT in the repo)
+- Created `D:/irm2pragmabot/groundedsam/.venv` (torch 2.5.1+cu121,
+  **transformers==4.44.2** — 5.x removed `BertModel.get_head_mask` and
+  GroundingDINO breaks). Plus `hydra-core iopath addict yapf timm supervision
+  pycocotools msgpack pyzmq`.
+- **Ran with `--device cpu` (~18s/request).** GroundingDINO's `_C` CUDA
+  extension is not compiled here: the laptop has the NVIDIA driver but no CUDA
+  toolkit (`nvcc` absent). `ms_deform_attn.py:330` takes the CUDA branch when
+  tensors are on GPU and raises `NameError: _C`; CPU routes to the pure-PyTorch
+  fallback already in that file. **The code default is still `cuda`** — Alonnisos
+  has the toolkit, so the lab runs the GPU path unchanged.
+- To use the GPU *on the laptop* you would install the CUDA 12.1 toolkit and
+  rebuild the extension (`pip install --no-build-isolation -e grounding_dino/`,
+  with MSVC 2022 already present). Not needed for the project — the lab GPU is
+  the target — so it was left alone.
 
 ---
 
