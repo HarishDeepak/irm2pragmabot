@@ -50,15 +50,28 @@ default single-threaded executor and a mutually-exclusive callback group
 that is an immediate deadlock - the callback waits for a future that only
 the executor it is blocking could ever complete.
 
-PERCEPTION IS NOT WIRED IN YET. The action carries `target_object` as
-text, but grasp generation (GroundedSAM -> mask -> point cloud ->
-GraspGen) still runs offline as separate scripts. The server therefore
-uses the pre-computed `grasp_file`/`object_pcd_file` node parameters and
-logs a warning when the requested target_object cannot be verified
-against them. Closing that loop is the next step after this one.
+PERCEPTION IS WIRED IN (use_live_perception, default true). Each pick
+resolves the action's `target_object` live: PerceptionClient (ZMQ :5557,
+GroundedSAM -> mask -> filtered cloud) then GraspGen (ZMQ :5556), via
+live_perception.LivePerception. Previously the bridge read a pre-computed
+`grasp_file` parameter and ignored `target_object` entirely, so "pick the
+red cup" picked whatever was segmented in the last offline run - and a
+success on the wrong object writes a fabricated entry into the long-term
+memory this project is graded on.
+
+Set use_live_perception:=false to fall back to the `grasp_file` /
+`object_pcd_file` parameters for offline replay against a saved npz.
+
+REQUIRES `self._scene_source` to be set to a callable returning
+(rgb, depth, intrinsics). This node deliberately does not subscribe to the
+camera itself - the planner's SceneObserver already reads those
+BEST_EFFORT topics, and a second subscriber here would compete with it.
+Until it is injected, a pick fails with a reason rather than guessing.
 """
 
+import tempfile
 import time
+from pathlib import Path
 
 import numpy as np
 import rclpy
@@ -123,7 +136,23 @@ class PragmabotBridge(Node):
         # execute_pick(), consumed by execute_place().
         self._last_grasp_T_base = None
 
+        # Callable returning (rgb, depth, intrinsics) for live perception.
+        # Left None deliberately: this node does not own a camera
+        # subscription, and adding one would put a second subscriber on the
+        # same BEST_EFFORT sensor topics the planner's SceneObserver
+        # already reads. Inject it instead. Until it is set,
+        # _resolve_grasps() fails with a reason rather than guessing.
+        self._scene_source = None
+
+        # grasp_file is now a FALLBACK, used only when use_live_perception
+        # is false. Live perception resolves the planner's target_object
+        # per pick; the parameter is kept so offline replay against a saved
+        # npz still works.
         self.declare_parameter("grasp_file", "")
+        self.declare_parameter("use_live_perception", True)
+        self.declare_parameter("perception_host", "127.0.0.1")
+        self.declare_parameter("perception_port", 5557)
+        self.declare_parameter("graspgen_port", 5556)
         self.declare_parameter("group_name", "fr3_arm")
         self.declare_parameter("eef_link", "fr3_hand")
         self.declare_parameter("standoff_m", 0.12)
@@ -484,6 +513,78 @@ class PragmabotBridge(Node):
     # ExecuteSkill action server - the planner <-> robot connection
     # ------------------------------------------------------------------
 
+    def _resolve_grasps(self, target_object: str):
+        """Turn the planner's target_object into a grasp file, live.
+
+        Runs GroundedSAM -> cloud -> GraspGen for THIS object and writes the
+        result in the same .npz layout graspgen_client.py --save_grasps
+        produces, so execute_pick() and grasp_transform.load_all_grasps()
+        are reused unchanged - including the centroid convention, which is
+        the easiest thing to get silently wrong here.
+
+        Falls back to the legacy `grasp_file` parameter when
+        `use_live_perception` is false, so offline replay against a saved
+        npz still works.
+
+        Returns:
+            (grasp_file_path, reason). path is "" on failure, and reason is
+            the text the planner will reflect on.
+        """
+        if not self.get_parameter("use_live_perception").value:
+            legacy = self.get_parameter("grasp_file").get_parameter_value().string_value
+            if not legacy:
+                return "", (
+                    "use_live_perception is false and the grasp_file parameter "
+                    "is empty - either start the perception servers or point "
+                    "grasp_file at a saved .npz")
+            return legacy, f"using pre-computed {legacy} (live perception disabled)"
+
+        if self._scene_source is None:
+            return "", (
+                "live perception is enabled but no RGB-D source is configured; "
+                "set the rgb/depth/camera_info topics or disable "
+                "use_live_perception")
+
+        try:
+            rgb, depth, intrinsics = self._scene_source()
+        except Exception as exc:  # noqa: BLE001
+            return "", f"could not capture an RGB-D frame: {type(exc).__name__}: {exc}"
+
+        from pragmabot_bridge.live_perception import LivePerception
+
+        perception = LivePerception(
+            host=self.get_parameter("perception_host").value,
+            perception_port=self.get_parameter("perception_port").value,
+            graspgen_port=self.get_parameter("graspgen_port").value,
+        )
+        grasps, confidences, cloud, reason = perception.grasps_for(
+            target_object, rgb, depth, intrinsics)
+        if grasps is None:
+            return "", reason
+
+        # Re-centre before saving so the file matches what
+        # graspgen_client.py --save_grasps writes, and load_all_grasps()
+        # adds the centroid back exactly once.
+        centroid = cloud[:, :3].mean(axis=0)
+        out = Path(tempfile.gettempdir()) / "pragmabot_live_grasps.npz"
+        saved = grasps.copy()
+        saved[:, :3, 3] -= centroid
+        np.savez(out, grasps=saved, centroid=centroid, confidences=confidences)
+        np.save(out.with_name("pragmabot_live_cloud.npy"), cloud)
+        return str(out), reason
+
+    def _live_cloud_path(self) -> str:
+        """Cloud from the most recent live detection, else the parameter.
+
+        execute_pick() uses this only to estimate gripper width at the
+        grasp contact point; falling back to the parameter keeps offline
+        replay working.
+        """
+        live = Path(tempfile.gettempdir()) / "pragmabot_live_cloud.npy"
+        if self.get_parameter("use_live_perception").value and live.is_file():
+            return str(live)
+        return self.get_parameter("object_pcd_file").get_parameter_value().string_value
+
     def _execute_skill_cb(self, goal_handle):
         """Dispatch one planner skill decision onto the robot.
 
@@ -508,16 +609,23 @@ class PragmabotBridge(Node):
         result = ExecuteSkill.Result()
         try:
             if skill == "pick":
-                feedback("picking")
-                grasp_file = self.get_parameter("grasp_file").get_parameter_value().string_value
+                feedback("perceiving")
+                # Resolve the planner's target_object to grasps NOW, rather
+                # than reading a pre-computed grasp_file. Without this the
+                # bridge picks whatever was segmented in the last offline
+                # run, and a "success" on the wrong object writes a
+                # fabricated entry into the graded memory.
+                grasp_file, perception_reason = self._resolve_grasps(request.target_object)
                 if not grasp_file:
                     result.success = False
-                    result.message = (
-                        "pick requested but the grasp_file parameter is empty - run the "
-                        "perception pipeline (detect_object.py -> mask_to_pointcloud.py -> "
-                        "graspgen_client.py --save_grasps) and set grasp_file to its output"
-                    )
+                    # The reason names the object, the confidences and the
+                    # guard that fired. It goes into STM and the VLM
+                    # reflects on it, so pass it through verbatim.
+                    result.message = f"pick aborted: {perception_reason}"
+                    self.get_logger().error(result.message)
                 else:
+                    self.get_logger().info(f"perception: {perception_reason}")
+                    feedback("picking")
                     ok = self.execute_pick(
                         grasp_file,
                         group_name=self.get_parameter("group_name").value,
@@ -529,9 +637,10 @@ class PragmabotBridge(Node):
                         gripper_force=self.get_parameter("gripper_force").value,
                         gripper_epsilon=self.get_parameter("gripper_epsilon").value,
                         camera_frame=self.get_parameter("camera_frame").value,
-                        object_pcd_file=self.get_parameter("object_pcd_file")
-                        .get_parameter_value()
-                        .string_value,
+                        # Prefer the cloud live perception just produced, so
+                        # the gripper width is estimated from THIS object
+                        # rather than a stale file.
+                        object_pcd_file=self._live_cloud_path(),
                         grasp_index=self.get_parameter("grasp_index").value,
                         place_after_s=0.0,  # the planner decides when to place
                         gripper_open_width=self.get_parameter("gripper_open_width").value,
