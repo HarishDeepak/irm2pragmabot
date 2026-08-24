@@ -158,3 +158,94 @@ def matrix_to_pose(T: np.ndarray) -> Pose:
     pose.orientation.z = qz
     pose.orientation.w = qw
     return pose
+
+
+# ---------------------------------------------------------------------
+# Trajectory safety — pure functions, no ROS calls, so they are testable
+# offline against a hand-built JointTrajectory.
+# ---------------------------------------------------------------------
+
+def retime_trajectory(joint_traj, factor: float):
+    """Slow a JointTrajectory down by `factor` (0.1 = ten times slower).
+
+    WHY THIS EXISTS. moveit_msgs/GetCartesianPath in Humble has NO
+    max_velocity_scaling_factor / max_acceleration_scaling_factor fields
+    (verified against the installed moveit_msgs 2.2.1; see moveit2 issue
+    #1967). The service returns a trajectory timed at full speed and there
+    is no request field to ask for less. The approach/lift motions - the
+    ones heading toward the table - therefore ran unscaled.
+
+    THE MATH. A trajectory is a geometric path q(s) plus a time map
+    s = f(t). Substituting t' = t / factor is a pure reparameterisation of
+    the SAME path: positions are unchanged, and by the chain rule
+    velocities scale by `factor` and accelerations by `factor**2`. Nothing
+    is approximated and no waypoint moves, so a path that was collision-
+    free stays collision-free. This is exact, not a heuristic.
+
+    Mutates and returns `joint_traj`.
+    """
+    if factor <= 0.0 or factor > 1.0:
+        raise ValueError(f"factor must be in (0, 1], got {factor}")
+    if factor == 1.0:
+        return joint_traj
+
+    scale = 1.0 / factor
+    for pt in joint_traj.points:
+        total_ns = (pt.time_from_start.sec * 1_000_000_000
+                    + pt.time_from_start.nanosec) * scale
+        pt.time_from_start.sec = int(total_ns // 1_000_000_000)
+        pt.time_from_start.nanosec = int(total_ns % 1_000_000_000)
+        pt.velocities = [v * factor for v in pt.velocities]
+        pt.accelerations = [a * factor * factor for a in pt.accelerations]
+    return joint_traj
+
+
+def max_joint_jump(joint_traj) -> float:
+    """Largest absolute joint step between consecutive waypoints, in rad.
+
+    The Cartesian service accepts `revolute_jump_threshold` but does not
+    forward it to the interpolator (moveit2 issue #2404), so asking for a
+    jump guard does not give you one. A near-singular configuration shows
+    up as a large joint step between two waypoints that are only 1 cm
+    apart in Cartesian space - which is exactly what this measures. Check
+    it client-side instead of trusting a parameter that is dropped.
+    """
+    pts = joint_traj.points
+    if len(pts) < 2:
+        return 0.0
+    worst = 0.0
+    for a, b in zip(pts, pts[1:]):
+        for qa, qb in zip(a.positions, b.positions):
+            worst = max(worst, abs(qb - qa))
+    return worst
+
+
+def joint_limit_margin(names, positions, limits) -> tuple:
+    """Smallest distance to any joint limit, and which joint it was.
+
+    `limits` maps joint name -> (lower, upper). FR3 limits are ASYMMETRIC
+    and joints 4 and 6 never contain zero, so a symmetric Panda-era
+    assumption is wrong on exactly the two joints that dominate a top-down
+    grasp. Returns (margin_rad, joint_name); margin is negative if a joint
+    is already past its limit.
+    """
+    worst, who = float("inf"), ""
+    for name, pos in zip(names, positions):
+        if name not in limits:
+            continue
+        lo, hi = limits[name]
+        m = min(pos - lo, hi - pos)
+        if m < worst:
+            worst, who = m, name
+    return (worst if worst != float("inf") else 0.0), who
+
+
+def config_distance(a, b) -> float:
+    """L-infinity joint-space distance in rad.
+
+    Used to prefer an IK solution near where the arm already is. The FR3
+    is 7-DoF against a 6-DoF pose goal, so a null space of solutions
+    reaches the identical gripper pose; without this the planner is free
+    to pick one that swings the base 124 degrees, which is what it did.
+    """
+    return max((abs(x - y) for x, y in zip(a, b)), default=0.0)

@@ -59,6 +59,15 @@ red cup" picked whatever was segmented in the last offline run - and a
 success on the wrong object writes a fabricated entry into the long-term
 memory this project is graded on.
 
+PLACEMENT IS ALSO PERCEIVED. When the planner names a `placement_object`,
+execute_place() runs the SAME detect -> mask -> depth pipeline against that
+surface (PerceptionClient :5557), picks a point well inside its mask via
+farthest-point sampling (calibration/mask_sampling.py), back-projects it
+with mask_to_pointcloud's own pinhole code and transforms it into
+fr3_link0. GraspGen is deliberately NOT called for this: a table or plate
+is not being grasped, and a grasp pose on it would mean nothing. The fixed
+place_offset_xyz survives only as the fallback.
+
 Set use_live_perception:=false to fall back to the `grasp_file` /
 `object_pcd_file` parameters for offline replay against a saved npz.
 
@@ -137,12 +146,16 @@ class PragmabotBridge(Node):
         self._last_grasp_T_base = None
 
         # Callable returning (rgb, depth, intrinsics) for live perception.
-        # Left None deliberately: this node does not own a camera
-        # subscription, and adding one would put a second subscriber on the
-        # same BEST_EFFORT sensor topics the planner's SceneObserver
-        # already reads. Inject it instead. Until it is set,
-        # _resolve_grasps() fails with a reason rather than guessing.
-        self._scene_source = None
+        #
+        # The original objection to setting this here was that a permanent
+        # camera subscription on the bridge would compete with the
+        # planner's SceneObserver on the same BEST_EFFORT sensor topics.
+        # capture_scene.capture() does not create one: it builds a
+        # throwaway node, takes ONE frame, and destroys the subscription
+        # again. Nothing is subscribed between picks, so there is nothing
+        # to compete with - and injection still overrides it, so replay and
+        # tests can substitute a canned frame.
+        self._scene_source = self._capture_scene
 
         # grasp_file is now a FALLBACK, used only when use_live_perception
         # is false. Live perception resolves the planner's target_object
@@ -162,6 +175,11 @@ class PragmabotBridge(Node):
         self.declare_parameter("gripper_force", 20.0)
         self.declare_parameter("gripper_epsilon", 0.02)
         self.declare_parameter("camera_frame", "zed_left_camera_frame_optical")
+        self.declare_parameter("color_topic", "/zed/zed_node/rgb/color/rect/image")
+        self.declare_parameter("depth_topic", "/zed/zed_node/depth/depth_registered")
+        self.declare_parameter("camera_info_topic",
+                               "/zed/zed_node/rgb/color/rect/image/camera_info")
+        self.declare_parameter("capture_timeout_s", 15.0)
         self.declare_parameter("object_pcd_file", "")
         self.declare_parameter("grasp_index", -1)
         self.declare_parameter("revolute_jump_threshold", 0.2)
@@ -169,20 +187,40 @@ class PragmabotBridge(Node):
         self.declare_parameter("gripper_open_width", 0.08)
         self.declare_parameter("home_gripper_first", True)
 
-        # Where execute_place() drops the object, as an [x, y, z] offset in
-        # fr3_link0 applied to the pose the object was picked from. A pure
-        # offset (rather than an absolute pose) keeps the approach
-        # orientation that already worked for this object, and only moves
-        # where it lands. Default: 20cm to the robot's left, same height.
+        # FALLBACK drop location: an [x, y, z] offset in fr3_link0 applied
+        # to the pose the object was picked from. A pure offset (rather than
+        # an absolute pose) keeps the approach orientation that already
+        # worked for this object, and only moves where it lands. Default:
+        # 20cm to the robot's left, same height.
         #
-        # ponytail: fixed offset, not a perceived target location. The
-        # planner's `placement_object` ("put it ON the plate") is accepted
-        # and logged but NOT yet resolved to a pose - that needs the same
-        # GroundedSAM->cloud step as picking, on the placement object. This
-        # is the honest minimum that makes place work end-to-end today;
-        # upgrade to perceived placement when the perception loop is wired
-        # into this node.
+        # This is no longer the only path. When the planner names a
+        # `placement_object`, execute_place() perceives that surface and
+        # places on it (see _resolve_placement). The offset below is used
+        # only when no placement object was named, or when perceiving it
+        # failed - and in that case the returned message says a perceived
+        # pose was attempted and why it was not used, because the planner
+        # reflects on that text.
         self.declare_parameter("place_offset_xyz", [0.0, 0.20, 0.0])
+
+        # --- perceived placement ---------------------------------------
+        # Gap left between the held object's lowest point and the perceived
+        # surface at release. The object is dropped this far, not lowered
+        # onto contact: the arm has no force feedback in this path, so
+        # descending until it touches would press the object into the table.
+        self.declare_parameter("place_clearance_m", 0.01)
+        # How many farthest-point candidates to consider on the placement
+        # mask, and how far from the mask's edge the winner must be. See
+        # calibration/mask_sampling.py for why plain FPS alone picks corners.
+        self.declare_parameter("placement_fps_candidates", 16)
+        self.declare_parameter("placement_interior_px", 8)
+        # Side of the pixel patch whose median depth becomes the placement
+        # point. One pixel is one stereo match; a single bad match would
+        # move the release point by tens of centimetres.
+        self.declare_parameter("placement_patch_px", 5)
+        # Mask-area ceiling for a PLACEMENT surface. The pick path keeps the
+        # object-sized 40% bound; a table measured 51% of this rig's frame,
+        # so reusing the object bound would refuse every real surface.
+        self.declare_parameter("placement_max_mask_frac", 0.85)
 
         self.get_logger().info(
             "pragmabot_bridge started - waiting for /move_action, "
@@ -414,6 +452,7 @@ class PragmabotBridge(Node):
         lift_m: float = 0.12,
         gripper_open_width: float = 0.08,
         gripper_speed: float = 0.05,
+        camera_frame: str = "zed_left_camera_frame_optical",
     ) -> tuple[bool, str]:
         """Place the currently-held object at an offset from where it was picked.
 
@@ -429,8 +468,24 @@ class PragmabotBridge(Node):
         orientation from scratch would risk a pose MoveIt cannot reach.
 
         `placement_object` is the planner's semantic target ("the plate").
-        It is currently logged only - see the place_offset_xyz parameter
-        docstring for why, and what closing that gap requires.
+        It IS resolved to a real pose now: _resolve_placement() detects that
+        surface with the same GroundedSAM pipeline used for picking, chooses
+        a point well inside its mask, and returns it in fr3_link0. Only the
+        translation is taken from perception - the rotation stays the one
+        that was already proven reachable on this object, for the same
+        reason the fixed-offset path kept it.
+
+        The height is not the bare surface point: the object hangs below the
+        gripper, so the release pose is the perceived surface z, plus how far
+        the gripper origin sat above the object's own lowest visible point
+        when it grasped it (_hold_height), plus `place_clearance_m`.
+
+        When no placement object is named, or perceiving it fails, the fixed
+        `offset_xyz` is used instead - and the returned message says a
+        perceived pose was attempted and why it was not used. That text is a
+        deliverable: the planner writes it into STM and self-reflects on it,
+        so "fell back to a fixed 20 cm offset because the plate was not
+        detected" changes the next plan, while a bare False does not.
 
         Returns:
             (success, message) - message names the failing step, so the
@@ -443,17 +498,27 @@ class PragmabotBridge(Node):
                 "nothing is held, and there is no known grasp pose to place from"
             )
 
-        if placement_object:
-            self.get_logger().warn(
-                f"placement_object={placement_object!r} is not yet resolved to a "
-                "perceived pose; using the fixed place_offset_xyz instead. The "
-                "object will be placed at a preset offset, NOT necessarily on "
-                f"the {placement_object}."
-            )
-
-        # Target = the proven grasp pose, translated. Rotation untouched.
+        # Target = the proven grasp pose with a new translation. Rotation
+        # untouched either way: it is the one MoveIt already reached for this
+        # object, and re-deriving one risks a pose it cannot.
         place_T_base = self._last_grasp_T_base.copy()
-        place_T_base[:3, 3] += np.asarray(offset_xyz, dtype=np.float64)
+
+        point_base, placement_reason = self._resolve_placement(
+            placement_object, camera_frame)
+
+        if point_base is None:
+            place_T_base[:3, 3] += np.asarray(offset_xyz, dtype=np.float64)
+            self.get_logger().warn(placement_reason)
+        else:
+            hold_m, hold_reason = self._hold_height(camera_frame)
+            clearance = float(self.get_parameter("place_clearance_m").value)
+            place_T_base[:3, 3] = point_base
+            place_T_base[2, 3] += hold_m + clearance
+            placement_reason = (
+                f"{placement_reason}; {hold_reason}; releasing "
+                f"{(hold_m + clearance) * 100:.1f} cm above the perceived surface"
+            )
+            self.get_logger().info(placement_reason)
 
         approach_T_base = place_T_base.copy()
         approach_T_base[2, 3] += standoff_m
@@ -466,16 +531,17 @@ class PragmabotBridge(Node):
         if not self._move_to_pose(
             group_name, eef_link, grasp_transform.matrix_to_pose(approach_T_base)
         ):
-            return False, "place: failed to reach the pre-place approach pose"
+            return False, f"place: failed to reach the pre-place approach pose ({placement_reason})"
 
         # Step 2: straight-line descent to the place pose.
         place_pose_msg = grasp_transform.matrix_to_pose(place_T_base)
         cart = self._compute_cartesian_path(group_name, eef_link, [place_pose_msg])
         if cart is None or cart.fraction < 1.0:
             frac = None if cart is None else cart.fraction
-            return False, f"place: descent path incomplete (fraction={frac})"
+            return False, (f"place: descent path incomplete (fraction={frac}) "
+                           f"({placement_reason})")
         if not self._execute_trajectory(cart.solution):
-            return False, "place: descent execution failed"
+            return False, f"place: descent execution failed ({placement_reason})"
 
         # Step 3: open to release. Move, not Grasp - no contact force wanted.
         if not self._open_gripper(gripper_open_width, gripper_speed):
@@ -500,7 +566,7 @@ class PragmabotBridge(Node):
         # Held object is gone; a further place has nothing to place.
         self._last_grasp_T_base = None
         self.get_logger().info("Place sequence complete")
-        return True, "place completed"
+        return True, f"place completed - {placement_reason}"
 
     def execute_push(self, target_object: str, goal_region: str):
         """Out of scope for this project - the supervisor advised focusing on
@@ -572,6 +638,152 @@ class PragmabotBridge(Node):
         np.savez(out, grasps=saved, centroid=centroid, confidences=confidences)
         np.save(out.with_name("pragmabot_live_cloud.npy"), cloud)
         return str(out), reason
+
+    def _capture_scene(self):
+        """One live RGB-D frame as (rgb, depth, intrinsics). The default
+        `_scene_source`.
+
+        Delegates to calibration/capture_scene.py, which is pure
+        rclpy+numpy (no cv_bridge) and handles the two traps that make this
+        fail silently rather than loudly: the ZED's BEST_EFFORT QoS, which
+        a default RELIABLE subscription never matches, and the 32FC1-metres
+        vs 16UC1-millimetres depth encoding split, which is a 1000x error
+        that passes every downstream guard because only the SCALE is wrong.
+        """
+        from pragmabot_bridge.live_perception import _calibration_dir
+        _calibration_dir()
+        import capture_scene  # noqa: PLC0415
+
+        return capture_scene.capture(
+            color_topic=self.get_parameter("color_topic").value,
+            depth_topic=self.get_parameter("depth_topic").value,
+            info_topic=self.get_parameter("camera_info_topic").value,
+            timeout_s=self.get_parameter("capture_timeout_s").value,
+            verbose=False,
+        )
+
+    def _resolve_placement(self, placement_object: str, camera_frame: str):
+        """Turn the planner's placement_object into a point in fr3_link0.
+
+        The placement counterpart of _resolve_grasps(), and deliberately
+        NOT a call to GraspGen: a surface is not a graspable object, so
+        there is no grasp to generate. What comes back is one point on the
+        surface - detected with the same GroundedSAM server and the same
+        guards as picking, chosen away from the surface's rim, and
+        back-projected with mask_to_pointcloud's own pinhole code.
+
+        Every failure path returns (None, reason) rather than raising, and
+        every reason states that a perceived pose WAS attempted and what
+        stopped it. execute_place() then falls back to place_offset_xyz and
+        puts that sentence in the ExecuteSkill message, where the planner's
+        self-reflection reads it. A silent fallback would let the planner
+        believe "place on the plate" succeeded on the plate.
+
+        Returns:
+            (point_base, reason). point_base is (3,) in fr3_link0, or None.
+        """
+        if not placement_object or not placement_object.strip():
+            return None, (
+                "no placement object was named in the action, so the object was "
+                "released at the fixed place_offset_xyz relative to where it was "
+                "picked up - not on any perceived surface")
+
+        prefix = (f"a perceived placement pose on {placement_object!r} was "
+                  f"attempted but ")
+        suffix = ("; the object was released at the fixed place_offset_xyz "
+                  "instead, so it is NOT necessarily on "
+                  f"the {placement_object}")
+
+        if not self.get_parameter("use_live_perception").value:
+            return None, (prefix + "use_live_perception is false on this node"
+                          + suffix)
+
+        if self._scene_source is None:
+            return None, (prefix + "the bridge has no RGB-D source configured "
+                          "(_scene_source is unset)" + suffix)
+
+        try:
+            rgb, depth, intrinsics = self._scene_source()
+        except Exception as exc:  # noqa: BLE001
+            return None, (prefix + "an RGB-D frame could not be captured "
+                          f"({type(exc).__name__}: {exc})" + suffix)
+
+        from pragmabot_bridge.live_perception import LivePerception
+
+        perception = LivePerception(
+            host=self.get_parameter("perception_host").value,
+            perception_port=self.get_parameter("perception_port").value,
+            graspgen_port=self.get_parameter("graspgen_port").value,
+        )
+        point_cam, reason, _info = perception.surface_point_for(
+            placement_object, rgb, depth, intrinsics,
+            n_candidates=self.get_parameter("placement_fps_candidates").value,
+            min_interior_px=self.get_parameter("placement_interior_px").value,
+            patch_px=self.get_parameter("placement_patch_px").value,
+            max_mask_frac=self.get_parameter("placement_max_mask_frac").value,
+        )
+        if point_cam is None:
+            return None, prefix + reason + suffix
+
+        # Same TF pattern execute_pick() uses - one lookup_transform resolves
+        # the whole fr3_link0 -> ... -> optical chain.
+        try:
+            self._wait_for_transform("fr3_link0", camera_frame)
+            stamped = self._tf_buffer.lookup_transform(
+                "fr3_link0", camera_frame, rclpy.time.Time()
+            )
+            T_base_from_cam = grasp_transform.transform_to_matrix(stamped)
+        except Exception as exc:  # noqa: BLE001
+            return None, (prefix + f"the TF lookup fr3_link0 <- {camera_frame} "
+                          f"failed ({exc})" + suffix)
+
+        point_base = (T_base_from_cam @ np.append(np.asarray(point_cam, float), 1.0))[:3]
+        return point_base, (
+            f"{reason}; in fr3_link0 that is "
+            f"[{point_base[0]:.3f}, {point_base[1]:.3f}, {point_base[2]:.3f}] m")
+
+    def _hold_height(self, camera_frame: str) -> tuple[float, str]:
+        """How far the gripper origin sat above the held object's lowest point.
+
+        Needed because a perceived surface point is where the OBJECT must
+        end up, while the pose commanded to MoveIt is where the GRIPPER
+        goes. The offset between them is the object's own height above its
+        grasp, which is measured, not assumed: the cloud saved during the
+        pick is transformed into fr3_link0 and its minimum z is subtracted
+        from the grasp pose's z.
+
+        Returns (metres, reason). On any failure it returns 0.0 and says so -
+        the object is then released from the surface plus the clearance only,
+        which drops it from roughly its own height. That is a real behaviour
+        change worth reflecting on, so it goes in the message.
+        """
+        unknown = ("the held object's height above the grasp could not be "
+                   "measured, so the release height is the clearance alone "
+                   "and the object will drop from about its own height")
+
+        path = self._live_cloud_path()
+        if not path or not Path(path).is_file() or self._last_grasp_T_base is None:
+            return 0.0, unknown
+
+        try:
+            cloud_cam = np.load(path).astype(np.float64)[:, :3]
+            stamped = self._tf_buffer.lookup_transform(
+                "fr3_link0", camera_frame, rclpy.time.Time()
+            )
+            T = grasp_transform.transform_to_matrix(stamped)
+            cloud_base = (T[:3, :3] @ cloud_cam.T).T + T[:3, 3]
+            hold = float(self._last_grasp_T_base[2, 3] - cloud_base[:, 2].min())
+        except Exception:  # noqa: BLE001
+            return 0.0, unknown
+
+        # A gripper more than half a metre above the thing it is holding, or
+        # below it, means the cloud and the grasp are not the same object.
+        if not 0.0 <= hold <= 0.5:
+            return 0.0, (f"the measured hold height {hold:.3f} m is not "
+                         "physically plausible, so it was ignored; " + unknown)
+
+        return hold, (f"the gripper held the object {hold * 100:.1f} cm above "
+                      "its lowest visible point")
 
     def _live_cloud_path(self) -> str:
         """Cloud from the most recent live detection, else the parameter.
@@ -664,6 +876,7 @@ class PragmabotBridge(Node):
                     lift_m=self.get_parameter("lift_m").value,
                     gripper_open_width=self.get_parameter("gripper_open_width").value,
                     gripper_speed=self.get_parameter("gripper_speed").value,
+                    camera_frame=self.get_parameter("camera_frame").value,
                 )
                 result.success = ok
                 result.message = message

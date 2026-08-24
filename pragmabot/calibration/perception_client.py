@@ -43,6 +43,10 @@ class DetectionResult:
     confidence: float = 0.0
     label: str = ""
     reason: str = ""
+    # Only populated when detect(..., return_mask=True). The placement path
+    # needs the 2D mask to choose a point on the surface; the pick path does
+    # not, and does not pay for it.
+    mask: Optional[np.ndarray] = None
 
 
 class PerceptionClient:
@@ -122,7 +126,9 @@ class PerceptionClient:
 
         return DetectionResult(ok=True, points=_npy_load(rep["points"]),
                                n_points=rep["n_points"],
-                               confidence=rep["confidence"], label=rep["label"])
+                               confidence=rep["confidence"], label=rep["label"],
+                               mask=(_npy_load(rep["mask"]).astype(bool)
+                                     if "mask" in rep else None))
 
 
 def _as_intrinsics_dict(K) -> dict:
