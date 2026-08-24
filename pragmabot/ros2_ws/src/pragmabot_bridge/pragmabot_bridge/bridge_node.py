@@ -235,6 +235,34 @@ class PragmabotBridge(Node):
         # Grasps below this GraspGen confidence are skipped when a better one
         # exists. Ignored entirely if it would leave no candidate at all.
         self.declare_parameter("min_grasp_confidence", 0.80)
+        # Grasps whose approach axis is more than this many degrees off
+        # straight-down are excluded entirely, before confidence is even
+        # considered - a tilted approach risks the fingers clipping the
+        # table. UNLIKE min_grasp_confidence, this gate fails CLOSED: if
+        # nothing qualifies, execute_pick aborts (see the grasp_index < 0
+        # check below) rather than falling back to the least-tilted
+        # candidate anyway. 20 deg is a starting point (a two-finger
+        # top-down grasp on a small tabletop object), not empirically
+        # tuned; 0 disables the gate. Briefly defaulted to 0 on
+        # 2026-08-24 to isolate a motion-planning issue from grasp
+        # quality - reverted after confirming with live data that every
+        # "best confidence" failure since was this gate's exact target
+        # (one measured case: the top-confidence grasp's target was
+        # 7cm BELOW the robot's own base origin - physically under the
+        # table, not a false alarm).
+        self.declare_parameter("max_grasp_tilt_deg", 20.0)
+        # Keep only the top-K GraspGen candidates by confidence before the
+        # tilt gate/selection ever sees them. 0 = no cap (~100 candidates,
+        # as GraspGen returns by default) - DEFAULT, after 2026-08-24
+        # testing: a top-6 cap caused a real pick to abort ("no candidate
+        # within 20 deg") on the SAME cube that succeeded moments earlier
+        # with the full ~100 - the one near-vertical candidate (tilt 2.7
+        # deg) ranked #9 by confidence, outside the top-6 cutoff. Confirms
+        # the tradeoff isn't worth it: fewer candidates only shrinks the
+        # tilt gate's chances of finding a valid one, no upside. Client-
+        # side cap, see LivePerception.grasp_topk, if a future reason to
+        # use a nonzero value comes up.
+        self.declare_parameter("grasp_topk", 0)
         self.declare_parameter("action_result_timeout_s", 120.0)
         self.declare_parameter("place_after_s", 0.0)
         self.declare_parameter("gripper_open_width", 0.08)
@@ -384,20 +412,47 @@ class PragmabotBridge(Node):
                     f"Could not read confidences from {grasp_file}: {exc} - "
                     "selecting on top-down alignment alone"
                 )
+            max_tilt_deg = float(self.get_parameter("max_grasp_tilt_deg").value)
             grasp_index = grasp_transform.select_grasp_index(
                 grasps_T_base, confidences,
                 min_confidence=float(self.get_parameter("min_grasp_confidence").value),
+                max_tilt_deg=max_tilt_deg,
             )
+            if grasp_index < 0:
+                # select_grasp_index's tilt gate fails CLOSED (see its
+                # docstring): -1 means every candidate was more than
+                # max_tilt_deg off perpendicular, not "pick the least-bad
+                # one anyway". This message goes into the planner's
+                # self-reflection the same way every other execute_pick
+                # failure does (_fail_log), so it needs to suggest
+                # something the planner can actually act on next - here,
+                # that the OBJECT's pose is the problem, not the grasp/
+                # trajectory/gripper, since no near-vertical approach
+                # existed for it in this orientation at all.
+                self._fail_log(
+                    f"No grasp candidate within {max_tilt_deg:.0f} deg of "
+                    "perpendicular to the table - GraspGen did not offer a "
+                    "safe top-down approach for this object in its current "
+                    "pose. Try reorienting or repositioning the object "
+                    "(e.g. standing it more upright, or turning it so a "
+                    "flatter surface faces up) before retrying, rather "
+                    "than repeating the same pick."
+                )
+                return False
+            approach_axis = grasps_T_base[grasp_index, :3, :3] @ np.array([0.0, 0.0, 1.0])
+            tilt_deg = float(np.degrees(np.arccos(np.clip(-approach_axis[2], -1.0, 1.0))))
             if confidences is not None:
                 self.get_logger().info(
                     f"Auto-selected grasp {grasp_index}/{len(grasps_T_cam)} "
                     f"(confidence {confidences[grasp_index]:.3f}, best available "
-                    f"{np.max(confidences):.3f}) by confidence x top-down alignment"
+                    f"{np.max(confidences):.3f}, tilt {tilt_deg:.1f} deg from "
+                    "vertical) by confidence within the tilt gate"
                 )
             else:
                 self.get_logger().info(
                     f"Auto-selected grasp index {grasp_index}/{len(grasps_T_cam)} "
-                    "as the most top-down candidate (no confidences available)"
+                    f"as the most top-down candidate (no confidences available, "
+                    f"tilt {tilt_deg:.1f} deg from vertical)"
                 )
         elif grasp_index >= len(grasps_T_cam):
             self._fail_log(
@@ -427,9 +482,23 @@ class PragmabotBridge(Node):
         self.get_logger().info(f"standoff pose (fr3_link0):\n{standoff_T_base}")
         self.get_logger().info(f"grasp pose (fr3_link0):\n{grasp_T_base}")
 
-        # Step 1: MoveGroup to the pre-grasp standoff.
+        # Step 1: reach the pre-grasp standoff. Try a straight-line
+        # Cartesian path first - deterministic, and already collision- and
+        # jump-guarded by _compute_cartesian_path/_execute_trajectory, the
+        # same machinery Steps 2 and 4 below use. Fall back to free-space
+        # OMPL planning (_move_to_pose) only if the straight line itself
+        # isn't reachable. An unconstrained OMPL plan from wherever the arm
+        # currently is has no reason to prefer a short or direct path, and
+        # with no collision scene in MoveIt yet, nothing else biases it
+        # toward one either - this is the "weird trajectory" symptom seen
+        # in the 2026-08-24 evening run.
         standoff_pose_msg = grasp_transform.matrix_to_pose(standoff_T_base)
-        if not self._move_to_pose(group_name, eef_link, standoff_pose_msg):
+        cart = self._compute_cartesian_path(group_name, eef_link, [standoff_pose_msg])
+        if cart is not None and cart.fraction >= 1.0:
+            if not self._execute_trajectory(cart.solution):
+                self._fail_log("Cartesian path to standoff pose failed to execute - aborting")
+                return False
+        elif not self._move_to_pose(group_name, eef_link, standoff_pose_msg):
             self._fail_log("Failed to reach standoff pose - aborting")
             return False
 
@@ -700,6 +769,7 @@ class PragmabotBridge(Node):
             host=self.get_parameter("perception_host").value,
             perception_port=self.get_parameter("perception_port").value,
             graspgen_port=self.get_parameter("graspgen_port").value,
+            grasp_topk=int(self.get_parameter("grasp_topk").value),
         )
         grasps, confidences, cloud, reason = perception.grasps_for(
             target_object, rgb, depth, intrinsics)
@@ -792,6 +862,7 @@ class PragmabotBridge(Node):
             host=self.get_parameter("perception_host").value,
             perception_port=self.get_parameter("perception_port").value,
             graspgen_port=self.get_parameter("graspgen_port").value,
+            grasp_topk=int(self.get_parameter("grasp_topk").value),
         )
         point_cam, reason, _info = perception.surface_point_for(
             placement_object, rgb, depth, intrinsics,

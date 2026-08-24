@@ -60,30 +60,59 @@ def select_topdown_index(grasps_T_base: np.ndarray) -> int:
 
 
 def select_grasp_index(grasps_T_base: np.ndarray, confidences=None,
-                       min_confidence: float = 0.0) -> int:
-    """Best grasp by GraspGen confidence AND top-down alignment.
+                       min_confidence: float = 0.0,
+                       max_tilt_deg: float = 0.0) -> int:
+    """Best-confidence grasp among the candidates that are near-perpendicular
+    to the table. Returns -1 if none qualify - see below, this is a hard
+    filter, not a fallback-able preference.
 
-    WHY NOT select_topdown_index. That function takes argmin over the
-    approach axis alone, so out of 100 candidates spanning conf 0.66-0.95 it
-    returns whichever points straightest down - even if it is the WORST
-    grasp GraspGen scored. Geometry was being used to overrule the model's
-    own judgement about whether the gripper actually fits the object there.
+    WHY A HARD TILT GATE, NOT A SOFT SCORE FACTOR (as this used to be).
+    The previous version multiplied confidence by a continuous top-down
+    alignment factor (1.0=vertical ... 0.0=upward), so a confident but
+    badly tilted grasp could still outscore a well-aligned, merely-decent
+    one - the two traded off freely, and nothing stopped a near-horizontal
+    approach from winning just because GraspGen rated it highly. On this
+    table-mounted setup a steep tilt also means the fingers are more
+    likely to clip the table or a neighbouring object before ever reaching
+    the target, which a multiplicative score does not represent - it is a
+    hazard, not a mild preference.
 
-    Top-down still matters (a side approach on a table risks the fingers
-    hitting the surface), so it stays in the score rather than being
-    dropped: alignment maps straight-down to 1.0, horizontal to 0.5, and
-    upward to 0.0, and multiplies the confidence. A confident near-vertical
-    grasp beats a marginal perfectly-vertical one.
+    `max_tilt_deg` (degrees off straight-down; 0 disables the gate) REMOVES
+    any candidate outside that cone before ranking survivors by confidence:
+    "vertical enough AND confident", not "vertical enough to make up for
+    low confidence, or confident enough to make up for being sideways".
 
-    `min_confidence` discards candidates outright; if that would empty the
-    set the threshold is ignored rather than failing the pick, since a low
-    confidence grasp attempted is more informative than no attempt.
+    WHY NOT select_topdown_index. That function takes argmin over tilt
+    alone with no confidence involved, so out of 100 candidates spanning
+    conf 0.66-0.95 it returns whichever points straightest down - even if
+    it is the worst grasp GraspGen scored.
+
+    THE TILT GATE FAILS CLOSED, NOT OPEN: if no candidate is within
+    `max_tilt_deg`, this returns -1 rather than silently picking the
+    least-tilted (but still unsafe) option - a near-horizontal approach
+    attempted anyway is exactly the risk this gate exists to remove.
+    Callers must check for -1 and abort the pick with a reason (e.g. "no
+    near-perpendicular grasp available - try reorienting the object"),
+    not fall through with a negative index. `min_confidence` keeps the
+    older best-effort behaviour (ignored rather than emptying the tilt
+    survivors) since a merely low-confidence grasp is a judgement call,
+    not a collision risk.
     """
     approach_axis = grasps_T_base[:, :3, :3] @ np.array([0.0, 0.0, 1.0])
-    alignment = (1.0 - approach_axis[:, 2]) / 2.0
+    # Angle between the approach axis and straight down (base frame -Z).
+    # 0 deg = perpendicular to the table, 90 deg = horizontal.
+    tilt_deg = np.degrees(np.arccos(np.clip(-approach_axis[:, 2], -1.0, 1.0)))
+
+    if max_tilt_deg > 0.0:
+        tilt_keep = tilt_deg <= max_tilt_deg
+        if not tilt_keep.any():
+            return -1
+    else:
+        tilt_keep = np.ones(len(grasps_T_base), dtype=bool)
 
     if confidences is None:
-        return int(np.argmax(alignment))
+        candidates = np.where(tilt_keep)[0]
+        return int(candidates[np.argmin(tilt_deg[candidates])])
 
     conf = np.asarray(confidences, dtype=np.float64).reshape(-1)
     if len(conf) != len(grasps_T_base):
@@ -91,11 +120,13 @@ def select_grasp_index(grasps_T_base: np.ndarray, confidences=None,
             f"{len(conf)} confidences for {len(grasps_T_base)} grasps"
         )
 
-    score = conf * alignment
+    keep = tilt_keep.copy()
     if min_confidence > 0.0:
-        keep = conf >= min_confidence
-        if keep.any():
-            score = np.where(keep, score, -1.0)
+        conf_keep = conf >= min_confidence
+        if (keep & conf_keep).any():
+            keep &= conf_keep
+
+    score = np.where(keep, conf, -1.0)
     return int(np.argmax(score))
 
 

@@ -85,11 +85,20 @@ class LivePerception:
     def __init__(self, host: str = "127.0.0.1",
                  perception_port: int = DEFAULT_PERCEPTION_PORT,
                  graspgen_port: int = DEFAULT_GRASPGEN_PORT,
-                 timeout_ms: int = 60_000) -> None:
+                 timeout_ms: int = 60_000,
+                 grasp_topk: int = 0) -> None:
         self.host = host
         self.perception_port = perception_port
         self.graspgen_port = graspgen_port
         self.timeout_ms = timeout_ms
+        # Keep only the top-K candidates by GraspGen's own confidence
+        # before they ever reach select_grasp_index. 0 = no cap (all
+        # candidates GraspGen returns, currently ~100). Client-side, not
+        # passed to the server's own topk_num_grasps: that parameter was
+        # found NOT to hard-cap the response (a request for 6 returned 36
+        # in testing) - it appears to be a per-iteration, not global, cap
+        # server-side. Slicing here is the only way to get an exact count.
+        self.grasp_topk = grasp_topk
 
     def grasps_for(self, target_object: str, rgb: np.ndarray, depth: np.ndarray,
                    intrinsics) -> Tuple[Optional[np.ndarray], Optional[np.ndarray],
@@ -328,5 +337,10 @@ class LivePerception:
         # cloud (see load_all_grasps() in grasp_transform.py).
         grasps = grasps.copy()
         grasps[:, :3, 3] += centroid
+
+        if self.grasp_topk > 0 and len(grasps) > self.grasp_topk:
+            order = np.argsort(-confidences)[:self.grasp_topk]
+            grasps = grasps[order]
+            confidences = confidences[order]
 
         return grasps, confidences, ""

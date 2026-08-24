@@ -23,6 +23,91 @@
 
 ---
 
+## Quick paste — Terminal A / B (current, 2026-08-24 evening)
+
+Full sequence is `RUNBOOK.md` (steps 0-6) — this is just the two run
+commands for fast copy-paste once ZED, the robot+MoveIt+gripper container,
+the perception server (:5557), and the GraspGen server (:5556) are already
+up in their own terminals.
+
+**Before either terminal**, check the gripper gate (dies silently on User
+Stop, does not come back on its own):
+```bash
+ros2 action info /franka_gripper/homing     # must read: Action servers: 1
+```
+
+**Terminal A — bridge:**
+```bash
+export ROS_DOMAIN_ID=7
+source /opt/ros/humble/setup.bash
+source ~/pragmabot_bridge_ws/install/setup.bash
+export PYTHONPATH=$PYTHONPATH:$HOME/GraspGen
+ros2 run pragmabot_bridge bridge_node
+```
+Expect:
+```
+pragmabot_bridge started - waiting for /move_action, ...
+Serving /pragmabot/execute_skill - waiting for planner goals
+```
+
+**Terminal B — VLM planner + Gradio:**
+```bash
+export ROS_DOMAIN_ID=7
+source /opt/ros/humble/setup.bash
+source ~/pragmabot_bridge_ws/install/setup.bash
+export PYTHONPATH=$PYTHONPATH:$HOME/irm2pragmabot/pragmabot/pragmabot/src:$HOME/GraspGen
+cd ~/irm2pragmabot/pragmabot
+python3 pragmabot/nodes/pragmabot_node.py
+```
+Expect `Using claude-opus-4-8 with Anthropic`, then `Running on local URL:
+http://0.0.0.0:7860`. Do **not** run this from inside a venv — gradio and
+omegaconf are installed for the system python.
+
+Open `http://127.0.0.1:7860`, start a **fresh task**, prompt: `pick up the cube`
+(cube, not cup — see the night handoff §3: cups gave 0/100 grasps within 40°
+of vertical across two different physical cups, cubes gave a clean 2.7° tilt
+candidate. Pipeline geometry is confirmed correct; cups specifically aren't
+presenting a good top-down grasp from this camera's angle right now).
+
+**Gripper node restart** (inside the `franka_ros2_humble` container) — use
+when `ros2 action info /franka_gripper/homing` reads `Action servers: 0`
+(the node process itself died, usually from a User Stop):
+```bash
+docker exec -it -e DISPLAY=$DISPLAY franka_ros2_humble bash
+ros2 run franka_gripper franka_gripper_node --ros-args \
+  -r __node:=franka_gripper \
+  -p robot_ip:=10.10.10.10 \
+  -p joint_names:="[fr3_finger_joint1, fr3_finger_joint2]" \
+  --params-file /ros2_ws/install/franka_gripper/share/franka_gripper/config/franka_gripper_node.yaml
+```
+**Different from Desk showing "End Effector: Not connected" with the node
+still alive** — that's what the Franka Hand driver does after any failed
+Grasp/Move, until re-homed, not a hardware fault. Don't lock joints and
+reinitialize for that one; it's much lighter:
+```bash
+ros2 action send_goal /franka_gripper/homing franka_msgs/action/Homing "{}"
+```
+(or Desk's own Home button). The bridge already does this automatically on
+a failed grasp (one retry) — see `bridge_node.py`'s `home_gripper_first`.
+
+2026-08-24 evening fix built in: the standoff-move step (Step 1 of
+`execute_pick`) tries a straight-line Cartesian path first, falling back to
+free-space OMPL planning only if the straight line isn't reachable — was
+plain OMPL with no collision scene, the likely cause of the original "weird
+trajectory to reach" complaint.
+
+2026-08-24 night fixes built in (see `HANDOFF_2026-08-24_NIGHT.md` for full
+reasoning): grasp selection is now a hard, fail-closed perpendicularity gate
+(`max_grasp_tilt_deg`, default 20°) — aborts with a reason instead of
+attempting a badly-tilted grasp; `scripts/home_pose.py --record`/`--go` to
+save and return to a known arm pose between attempts (not yet used — do this
+first next session). **Left open and unresolved:** twice tonight, Terminal A
+logged a fully successful standoff+approach with zero errors while the
+operator observed no visible arm motion — see the night handoff §4, this
+needs to be chased down before trusting any "success" log at face value.
+
+---
+
 container franka:
 echo $ROS_DOMAIN_ID
 echo $DISPLAY
