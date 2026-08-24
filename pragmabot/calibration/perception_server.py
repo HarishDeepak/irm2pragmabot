@@ -161,7 +161,16 @@ class PerceptionServer:
 
             rgb = _npy_load(req["rgb"])
             depth = _npy_load(req["depth"])
-            K = np.asarray(req["intrinsics"]["K"], dtype=float).reshape(3, 3)
+            # mask_to_pointcloud.backproject() indexes K as a DICT
+            # (K["fx"], K["cx"], ...), not a 3x3 matrix - see raw_cloud().
+            # Passing a matrix raises IndexError deep inside back-projection.
+            # intrinsics.json on disk is already in this flat form.
+            K = req["intrinsics"]
+            missing = {"fx", "fy", "cx", "cy"} - set(K)
+            if missing:
+                return {"ok": False, "reason":
+                        f"intrinsics missing {sorted(missing)}; need flat "
+                        f"fx/fy/cx/cy as in extracted/*/intrinsics.json"}
 
             masks, confs, labels = self.detect(rgb, prompt)
             if masks is None:
