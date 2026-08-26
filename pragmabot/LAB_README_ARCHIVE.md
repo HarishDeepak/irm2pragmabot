@@ -1,110 +1,20 @@
-> **ARCHIVE — superseded.** For current operations read `RUNBOOK.md`; for
-> current state read `HANDOFF_2026-08-24_EVENING.md`. This file is kept only for
-> the 2026-07-25/27 FoundationPose calibration results and the reasoning behind
-> them. Note its "Still open / next steps" list is from July and has been
-> overtaken; the ZED->base calibration was redone on 2026-08-19 and corrected
-> again on 2026-08-24 (see the evening handoff §4).
-
 # Lab README — Archive (full version, up to 2026-07-27)
+echo 'export ANTHROPIC_API_KEY="REDACTED-ROTATE-THIS-KEY"' >> ~/.bashrc
+source ~/.bashrc
 
+echo $ANTHROPIC_API_KEY
 > This is the longer, earlier version of the lab notebook (376 lines).
 > The working copy `LAB_README.md` (149 lines) was later trimmed and lost
 > these sections. Kept because they contain calibration results and open
 > items recorded nowhere else:
 >
 > - Disk space
-> - FoundationPose: native build attempted, then abandoned for Docker
 > - The running setup (persists across terminal reboots)
 > - Calibration pipeline — new/changed files in this repo
 > - Host environment fix
 > - Calibration redo (2026-07-27)
 > - **Real calibration run (2026-07-25) — RESULT NOT YET FULLY TRUSTED**
 > - Still open / next steps
-
----
-
-## Quick paste — Terminal A / B (current, 2026-08-24 evening)
-
-Full sequence is `RUNBOOK.md` (steps 0-6) — this is just the two run
-commands for fast copy-paste once ZED, the robot+MoveIt+gripper container,
-the perception server (:5557), and the GraspGen server (:5556) are already
-up in their own terminals.
-
-**Before either terminal**, check the gripper gate (dies silently on User
-Stop, does not come back on its own):
-```bash
-ros2 action info /franka_gripper/homing     # must read: Action servers: 1
-```
-
-**Terminal A — bridge:**
-```bash
-export ROS_DOMAIN_ID=7
-source /opt/ros/humble/setup.bash
-source ~/pragmabot_bridge_ws/install/setup.bash
-export PYTHONPATH=$PYTHONPATH:$HOME/GraspGen
-ros2 run pragmabot_bridge bridge_node
-```
-Expect:
-```
-pragmabot_bridge started - waiting for /move_action, ...
-Serving /pragmabot/execute_skill - waiting for planner goals
-```
-
-**Terminal B — VLM planner + Gradio:**
-```bash
-export ROS_DOMAIN_ID=7
-source /opt/ros/humble/setup.bash
-source ~/pragmabot_bridge_ws/install/setup.bash
-export PYTHONPATH=$PYTHONPATH:$HOME/irm2pragmabot/pragmabot/pragmabot/src:$HOME/GraspGen
-cd ~/irm2pragmabot/pragmabot
-python3 pragmabot/nodes/pragmabot_node.py
-```
-Expect `Using claude-opus-4-8 with Anthropic`, then `Running on local URL:
-http://0.0.0.0:7860`. Do **not** run this from inside a venv — gradio and
-omegaconf are installed for the system python.
-
-Open `http://127.0.0.1:7860`, start a **fresh task**, prompt: `pick up the cube`
-(cube, not cup — see the night handoff §3: cups gave 0/100 grasps within 40°
-of vertical across two different physical cups, cubes gave a clean 2.7° tilt
-candidate. Pipeline geometry is confirmed correct; cups specifically aren't
-presenting a good top-down grasp from this camera's angle right now).
-
-**Gripper node restart** (inside the `franka_ros2_humble` container) — use
-when `ros2 action info /franka_gripper/homing` reads `Action servers: 0`
-(the node process itself died, usually from a User Stop):
-```bash
-docker exec -it -e DISPLAY=$DISPLAY franka_ros2_humble bash
-ros2 run franka_gripper franka_gripper_node --ros-args \
-  -r __node:=franka_gripper \
-  -p robot_ip:=10.10.10.10 \
-  -p joint_names:="[fr3_finger_joint1, fr3_finger_joint2]" \
-  --params-file /ros2_ws/install/franka_gripper/share/franka_gripper/config/franka_gripper_node.yaml
-```
-**Different from Desk showing "End Effector: Not connected" with the node
-still alive** — that's what the Franka Hand driver does after any failed
-Grasp/Move, until re-homed, not a hardware fault. Don't lock joints and
-reinitialize for that one; it's much lighter:
-```bash
-ros2 action send_goal /franka_gripper/homing franka_msgs/action/Homing "{}"
-```
-(or Desk's own Home button). The bridge already does this automatically on
-a failed grasp (one retry) — see `bridge_node.py`'s `home_gripper_first`.
-
-2026-08-24 evening fix built in: the standoff-move step (Step 1 of
-`execute_pick`) tries a straight-line Cartesian path first, falling back to
-free-space OMPL planning only if the straight line isn't reachable — was
-plain OMPL with no collision scene, the likely cause of the original "weird
-trajectory to reach" complaint.
-
-2026-08-24 night fixes built in (see `HANDOFF_2026-08-24_NIGHT.md` for full
-reasoning): grasp selection is now a hard, fail-closed perpendicularity gate
-(`max_grasp_tilt_deg`, default 20°) — aborts with a reason instead of
-attempting a badly-tilted grasp; `scripts/home_pose.py --record`/`--go` to
-save and return to a known arm pose between attempts (not yet used — do this
-first next session). **Left open and unresolved:** twice tonight, Terminal A
-logged a fully successful standoff+approach with zero errors while the
-operator observed no visible arm motion — see the night handoff §4, this
-needs to be chased down before trusting any "success" log at face value.
 
 ---
 
@@ -180,6 +90,38 @@ etc info
 - --box-threshold / --text-threshold (defaults 0.35/0.25) tune detection sensitivity if a prompt is missing or over-triggering.
 
 
+
+Full sequence from here:
+
+1. Restart the gripper node (inside the container, per RUNBOOK):
+docker exec -it -e DISPLAY=$DISPLAY franka_ros2_humble bash
+ros2 run franka_gripper franka_gripper_node --ros-args \
+  -r __node:=franka_gripper \
+  -p robot_ip:=10.10.10.10 \
+  -p joint_names:="[fr3_finger_joint1, fr3_finger_joint2]" \
+  --params-file /ros2_ws/install/franka_gripper/share/franka_gripper/config/franka_gripper_node.yaml
+Then re-check: ros2 action info /franka_gripper/homing → must read Action servers: 1.
+
+2. Record home (arm's current position, before anything moves):
+cd ~/irm2pragmabot/pragmabot
+python3 scripts/home_pose.py --record
+
+3. Terminal A (unchanged):
+export ROS_DOMAIN_ID=7
+source /opt/ros/humble/setup.bash
+source ~/pragmabot_bridge_ws/install/setup.bash
+export PYTHONPATH=$PYTHONPATH:$HOME/GraspGen
+ros2 run pragmabot_bridge bridge_node
+
+4. Terminal B (unchanged):
+export ROS_DOMAIN_ID=7
+source /opt/ros/humble/setup.bash
+source ~/pragmabot_bridge_ws/install/setup.bash
+export PYTHONPATH=$PYTHONPATH:$HOME/irm2pragmabot/pragmabot/pragmabot/src:$HOME/GraspGen
+
+cd ~/irm2pragmabot/pragmabot
+python3 pragmabot/nodes/pragmabot_node.py
+Open http://127.0.0.1:7860, fresh task, prompt pick up the cup.
 
 
 
@@ -259,6 +201,46 @@ This directly conflicts with the CLAUDE.md note "Do NOT reuse the old foundation
 What would you like to clarify?
 
 ✻ Churned for 49s
+
+
+
+ perception_server.py (in pragmabot/calibration/) is a small ZMQ server that turns a text prompt + an RGB-D frame into a 3D point cloud of the named object.
+
+      Why it exists: the models it drives — GroundingDINO (text→bounding box) and SAM 2 (box→pixel mask) — take about 5–10 seconds to load onto the GPU. The original code was two command-line scripts (detect_object.py, mask_to_pointcloud.py) that passed data through files, so wiring them into the robot loop would have meant reloading both models on every single pick. This server loads them once at startup and then answers requests forever, so each pick pays only for inference (~1 s), not the load.
+
+      There's a second, harder reason: three Python environments on this machine cannot be merged. GraspGen pins torch==2.1.0; Grounded-SAM-2 needs torch>=2.3.1; the ROS 2 node runs on system Python. So the models live in ~/groundedsam/.venv and the robot code talks to them over a socket instead of importing them. Same pattern NVIDIA already uses for GraspGen's own server on port 5556 — this one is its counterpart on port 5557.
+
+      The protocol is one msgpack dict in, one dict out:
+
+      request  {rgb, depth, intrinsics, prompt: "red cup.", return_mask: bool}
+      reply    {ok: true,  points, n_points, confidence, label, mask?}
+               {ok: false, reason: "<why>"}
+
+      Guards are the point of it. Handing the robot the wrong object is worse than handing it nothing — it would grasp whatever it's given, the success detector might report True because something moved, and a fabricated success gets written into the long-term memory this project is graded on. So it refuses rather than guessing, on: no match above threshold, ambiguous top-two detections (< 0.15 apart — this is what stops the e-stop button at 0.48 confidence being picked instead of the cube at 0.57), implausible mask area, or too few surviving cloud points.
+
+      Every refusal returns a reason string in plain language, not an error code. That string travels into the ExecuteSkill result → short-term memory → the VLM's self-reflection. So the wording is a deliverable, not a log line.
+
+      The return_mask flag is the one part added today, for placement: a table isn't grasped, so instead of a cloud for GraspGen the bridge needs the 2D mask to choose a point well inside the surface's edges.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 ==========================================================================
@@ -484,3 +466,294 @@ SESSION LOG — 2026-07-25 — FoundationPose calibration pipeline, end to end
    computed rotation's roll/pitch with the ZED's own IMU reading (IMU
    can't give yaw or translation, only roll/pitch from gravity) — only
    worth doing once IMU noise vs. vision noise is actually compared.
+
+
+
+
+
+
+Read extras/HANDOFF_SESSION.md, extras/HANDOFF_2026-08-24.md, and
+extras/TASKS_AND_GAPS.md first — all three, in that order. This continues
+work already in progress; do not re-derive facts already established there.
+
+CONTEXT: Franka FR3 ("Athna", IP 10.10.10.10, real hardware, arm ID
+10070378), ZED2 on a fixed tripod (not arm-mounted), ROS2 Humble. Grade
+depends on this working AND on the report honestly describing what was
+built and why. Getting something wrong here costs robot time, not just
+code review time.
+
+NEVER MODIFY (hard rule, inherited from upstream PragmaBot):
+vlm_client.py, vlm_task_planner.py, vlm_scene_describer.py,
+vlm_success_detector.py, vlm_exp_summarizer.py, memory_manager.py,
+scene_observer.py, conversation_builder.py.
+Only permitted edit pattern on the protected side: import + instantiate,
+never rewrite their internals.
+
+DO NOT run any command that moves the physical arm without me present and
+confirming out loud. Every stage below ends with an explicit STOP and a
+question for me before the next stage starts. Do not skip a stage because
+a later one "should" work — I want to see exactly where it breaks, not a
+finished pipeline I have to debug blind.
+
+Optional but encouraged: browse https://github.com/HarishDeepak/irobman_project
+(an earlier iRobMan project — Franka Panda, ROS1 Noetic, cube stacking) for
+IDEAS on how table/workspace safety zones were framed — specifically
+perception/src/franka_perception/safe_area.py (rectangle-in-frame safe zone
++ RViz markers) and geometry/plane_segmentation.py (RANSAC table-plane
+detection). Do NOT port code from it directly: it depends on Open3D and
+per-frame RANSAC plane fitting, and this project has already decided against
+both — mask_to_pointcloud.py must stay pure numpy (it runs in two GPU venvs
+with disjoint dependencies, see its own docstring), and the table here is
+static and already known from one-time calibration, not something that
+needs re-detecting every frame. Use the old repo for the shape of the idea
+(bounding rectangle, visual sanity-check marker), not the implementation.
+
+===========================================================================
+STAGE 1 — Resolve the table_z discrepancy (physical, ~15 min, you present)
+===========================================================================
+extras/HANDOFF_SESSION.md section 4 flags an unresolved 11cm gap:
+- The ZED<->base calibration file (fr3_zed_right.calib) implies
+  table_z ~ +0.005 m in fr3_link0.
+- But transforming the real cup point cloud
+  (pragmabot/extracted/red_cup/detections/object_pcd.npy) into fr3_link0
+  puts its base at z = -0.109 m.
+- Most likely explanation offered but UNCONFIRMED: fr3_link0's origin sits
+  ~11cm above the physical tabletop on its mounting plate.
+
+Give me the exact commands to run at the robot to settle this, in order:
+1. Jog the gripper fingertips until they just touch the tabletop (no
+   pressure), then: `ros2 run tf2_ros tf2_echo fr3_link0 fr3_hand_tcp`
+   -> this z IS table_z. Compare it against both the +0.005 and -0.109
+   candidates above and tell me which one it confirms, or if it's a third
+   value entirely.
+2. `ros2 run tf2_ros tf2_echo fr3_hand fr3_hand_tcp` -> expect translation
+   ~[0,0,0.1034]. Flag clearly if it's meaningfully different.
+3. `ros2 param get /move_group robot_description_semantic | grep -A3
+   'fr3_arm'` -> confirm which tip link MoveIt's planning group actually
+   uses, so later collision/Cartesian code targets the SAME link.
+4. `ros2 run tf2_ros tf2_echo fr3_link0 zed_left_camera_frame_optical`
+   -> confirm the calibration is live, not stale.
+5. With an object at each corner of the area we want reachable, read x/y
+   at each corner the same way, to get the usable rectangle. Cross-check
+   against extras/HANDOFF_SESSION.md's reach table (arm reach is the
+   binding constraint, not camera visibility — do not size the box by what
+   the camera can see).
+
+Write all six-ish numbers into pragmabot/config/workspace.yaml (create it):
+table_z, x_min, x_max, y_min, y_max, wall_height. table_z must come from
+step 1, not be guessed or left as the calibration-implied value unverified.
+
+STOP. Show me the numbers and your explanation for the 11cm gap before
+writing any code that depends on them.
+
+===========================================================================
+STAGE 2 — Workspace safety (B2): one box, enforced in two places
+===========================================================================
+Only after Stage 1's numbers are confirmed by me.
+
+1. pragmabot/config/workspace.yaml is the single source of truth (from
+   Stage 1). Nothing else hardcodes these numbers.
+2. bridge_node.py, at startup: push a table box + 4 thin wall boxes into
+   the MoveIt planning scene via the /apply_planning_scene SERVICE (not
+   the topic — a scene published before move_group subscribes is silently
+   dropped, already confirmed in the handoff). Use primitive_poses, not
+   CollisionObject.pose (disclaimed "not in use yet" in Humble). This is
+   what makes avoid_collisions=True mean something — right now the
+   planning scene is empty and MoveIt avoids nothing.
+3. calibration/mask_to_pointcloud.py: add --tf and --workspace options.
+   Transform the detected object cloud into fr3_link0, drop points outside
+   the box, transform back — GraspGen's contract (camera-frame input) must
+   stay unchanged. Insert this BEFORE the existing z-outlier/AABB stages.
+   MUST stay pure numpy (no Open3D, no scipy, no cv2) — this file runs in
+   both the groundedsam and GraspGen venvs, which share no dependencies.
+4. Add max_velocity_scaling_factor = 0.1 and
+   max_acceleration_scaling_factor = 0.1 to _compute_cartesian_path in
+   bridge_node.py. _move_to_pose already scales to 0.2 for the coarse
+   MoveGroup approach; the Cartesian approach/lift/retreat moves — the
+   ones that move TOWARD the table — currently run unscaled. Fix that.
+
+Do NOT use WorkspaceParameters (verified silent no-op on a fixed-base arm,
+see handoff section 5) or FR3 Desk "SLP-C" (kills FCI). Do not add RANSAC
+plane fitting or an octomap — the table is static and already known.
+
+Verify offline, no robot needed: the real cup cloud
+(pragmabot/extracted/red_cup/) must survive the crop with its known
+6.8cm height / 9.8x9.3cm footprint intact. Also verify in RViz (planning
+scene display) that the collision boxes actually appear where the real
+table is, BEFORE Stage 5 sends any goal.
+
+STOP. Show me the RViz screenshot / a description of the collision boxes
+before we go further.
+
+===========================================================================
+STAGE 3 — Inject bridge._scene_source
+===========================================================================
+bridge_node.py's module docstring says it deliberately does not subscribe
+to the
+share ONE SceneObserver instance. But right now bridge_node.py's main()
+runs as its own standalone process (`ros2 run pragmabot_bridge
+bridge_node`), separate from pragmabot_node.py's Gradio-driven process.
+
+I'm not certain the stated "second subscriber competes" claim is even
+true for a BEST_EFFORT topic with multiple subscribers — investigate this
+before designing around it:
+1. Check whether ROS2's BEST_EFFORT QoS actually has any issue with two
+   independent subscribers on the same topic (I don't believe it does —
+   confirm or refute with a source, not a guess).
+2. If it's genuinely fine: give bridge_node.py its OWN SceneObserver
+   instance (SceneObserver is a public, importable class — this only
+   violates "never modify", not "never import/instantiate"), and correct
+   the docstring's claim.
+3. If there IS a real reason to share one instance (e.g. request/response
+   locking in SceneObserver.get_scene_observation()'s
+   self.request_pending gate would misbehave with two callers): propose
+   how to co-locate both nodes in one process/executor instead, and what
+   that does to pragmabot_node.py's Gradio interface (which currently
+   presumably spins rclpy in a background thread — check main()/run()
+   there before assuming).
+Either way, justify the choice in writing, don't just pick one silently.
+
+Wire self._scene_source to return (rgb, depth, intrinsics) in the same
+shape perception_client.py already expects.
+
+Testable offline: with a bag or the extracted/red_cup/ files as a stand-in
+source, confirm _resolve_grasps() actually receives real (rgb, depth,
+intrinsics) instead of failing with "not injected".
+
+===========================================================================
+STAGE 4 — Two remaining robot-safety items (B3, B5)
+===========================================================================
+B3 — observation-pose retract: add a joint-space (JointConstraint, not
+Cartesian — always has an IK solution) retract to
+[-0.181, -0.420, 0.005, -2.260, -0.008, 1.806, 0.609] as a node parameter,
+called at the end of every skill and once before the first observation.
+Add a settle delay before capture (ZED ~9Hz, arm may still be
+decelerating) — this belongs inside where SceneObserver is called from
+bridge_node/wherever the retract is triggered, not duplicated per call
+site. This makes an existing claim in vlm_success_detector.py true (that
+file says the post-action image is captured with the arm returned to a
+default position — currently nothing does that).
+
+B5 — gripper holding-state guard: before dispatching pick/place, read
+actual finger positions from /franka_gripper/joint_states (confirm the
+real topic name and joint names first — nobody has verified these, don't
+assume). Refuse "pick while already holding" and "place while empty" with
+a REASON string (this feeds the planner's self-reflection / graded memory
+system, so the message text is a deliverable, not a log line). Use the
+gripper as ground truth, not the existing _last_grasp_T_base bookkeeping
+flag, which doesn't survive a node restart.
+
+===========================================================================
+STAGE 5 — Wire real placement (the FPS gap)
+===========================================================================
+Currently execute_place() only ever uses a fixed place_offset_xyz
+parameter ([0.0, 0.20, 0.0] — 20cm sideways). placement_object (e.g. "the
+plate") is accepted and logged but never resolved to an actual perceived
+pose — see bridge_node.py execute_place()'s own comment at line ~446-451.
+Separately, calibration/test_fps.py already implements farthest-point
+sampling to pick spread-out candidate points inside a mask, but it's
+standalone and never called from the runtime loop.
+
+Close this gap: when placement_object is non-empty, run it through the
+SAME live-perception path already used for target_object (GroundedSAM
+detect -> mask -> mask_to_pointcloud, now workspace-cropped per Stage 2)
+to get the placement surface's mask and depth, then use
+farthest_point_sampling() (promote it from test_fps.py into a real,
+importable module — decide whether it belongs in calibration/ or
+pra
+the REASON string, same pattern as the pick-side guards.
+
+Testable offline against extracted/ scenes with a second object as the
+"plate" stand-in, no robot needed for the perception half.
+
+STOP. Show me this working offline before it touches Stage 6.
+
+===========================================================================
+STAGE 6 — Pipeline + real pick test, via the action, manual and staged
+===========================================================================
+Do NOT run the full autonomous VLM planner loop first. Test the action
+server directly and manually, so I can see exactly which stage breaks.
+
+1. Re-confirm calibration/test_zmq_pipeline.sh still passes (GroundedSAM +
+   GraspGen only — no robot, already verified working on this GPU. Should
+   be unaffected by anything above; if it breaks, that's a regression to
+   fix before continuing).
+2. With both perception_server.py and graspgen_server.py running, and
+   Stage 2's collision boxes CONFIRMED visible in RViz, send exactly ONE
+   ExecuteSkill goal by hand from the CLI:
+     ros2 action send_goal /pragmabot/execute_skill \
+       pragmabot_interfaces/action/ExecuteSkill \
+
+4. Only after both pick and place succeed manually and repeatably, wire up
+   and run pragmabot_node.py's actual autonomous loop end to end — and
+   even then, start with one trivial single-step instruction, supervised,
+   not a multi-step task.
+
+At every step in this stage, tell me explicitly what you expect to happen
+BEFORE I run it, so a mismatch between expectation and reality is
+immediately visible rather than discovered after the fact.
+
+---
+
+A few notes before you use this:
+
+- Stage 1 needs you physically at the robot — Opus can hand you the exact commands but can't jog the arm itself. Same for the RViz check in Stage 2 and everything in Stage 6.
+- I structured it as six hard-gated stages specifically because you said you don't want to risk it — each one ends in a STOP, not a "continue automatically."
+- I did not include a rewrite of vlm_client.py/OpenAI-vs-Anthropic — that's already resolved (claude_vlm_client.py exists, auto-selected by model name, no protected-file changes needed).
+
+Want me to also append this as a new task entry (e.g. "B7") in extras/TASKS_AND_GAPS.md, matching the project's own convention, so it's tracked alongside the rest?
+
+✻ Sautéed for 1m 33s
+
+❯ if we use api key andopus5 for this task then how much would be the cost ? just curious
+
+● Skill(claude-api)
+
+Testable offline against extracted/ scenes with a second object as the
+"plate" stand-in, no robot needed for the perception half.
+
+STOP. Show me this working offline before it touches Stage 6.
+
+===========================================================================
+STAGE 6 — Pipeline + real pick test, via the action, manual and staged
+===========================================================================
+Do NOT run the full autonomous VLM planner loop first. Test the action
+server directly and manually, so I can see exactly which stage breaks.
+
+1. Re-confirm calibration/test_zmq_pipeline.sh still passes (GroundedSAM +
+   GraspGen only — no robot, already verified working on this GPU. Should
+   be unaffected by anything above; if it breaks, that's a regression to
+   fix before continuing).
+2. With both perception_server.py and graspgen_server.py running, and
+   Stage 2's collision boxes CONFIRMED visible in RViz, send exactly ONE
+   ExecuteSkill goal by hand from the CLI:
+     ros2 action send_goal /pragmabot/execute_skill \
+       pragmabot_interfaces/action/ExecuteSkill \
+       "{chosen_skill: 'pick', target_object: 'cup'}"
+   — NOT through pragmabot_node.py's Gradio loop. I want to watch homing ->
+   move-to-standoff -> Cartesian approach -> grasp -> lift as separate,
+   observable steps, with the ability to hit the E-stop between any of
+   them.
+3. Only after one pick+lift succeeds cleanly, repeat for place (fixed
+   offset first, then placement_object-driven via Stage 5), same manual
+   send_goal pattern.
+4. Only after both pick and place succeed manually and repeatably, wire up
+   and run pragmabot_node.py's actual autonomous loop end to end — and
+   even then, start with one trivial single-step instruction, supervised,
+   not a multi-step task.
+
+At every step in this stage, tell me explicitly what you expect to happen
+BEFORE I run it, so a mismatch between expectation and reality is
+immediately visible rather than discovered after the fact.
+
+---
+
+A few notes before you use this:
+
+- Stage 1 needs you physically at the robot — Opus can hand you the exact commands but can't jog the arm itself. Same for the RViz check in Stage 2 and everything in Stage 6.
+- I structured it as six hard-gated stages specifically because you said you don't want to risk it — each one ends in a STOP, not a "continue automatically."
+   not a multi-step task.
+
+At every step in this stage, tell me explicitly what you expect to happen
+BEFORE I run it, so a mismatch between expectation and reality is
+immediately visible rather than discovered after the fact.

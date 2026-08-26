@@ -1,0 +1,60 @@
+rosbag_replay: true
+gradio_share: false
+
+# Hard cap on planning steps per task. Both a safety valve (an uncapped VLM
+# commanding a 7-DoF arm is the most dangerous thing in this codebase) and a
+# measurement: "steps to completion, capped at N" is the paper's headline
+# metric, and an uncapped run has no denominator. Also bounds STM growth,
+# since every STM entry is re-sent in every later planner prompt.
+max_steps: 10
+
+# --- Memory Settings ---
+activate_stm: true
+activate_ltm: true
+save_to_ltm: true
+use_random_retrieval: false
+retrieval_top_k: 5  # -1 for everything (unsorted)
+
+# --- VLM API ---
+# OpenAI:   vlm_model: gpt-4o-2024-08-06   (needs OPENAI_API_KEY)
+# Anthropic: vlm_model: claude-opus-4-8     (needs ANTHROPIC_API_KEY)
+# Gemini:   vlm_model: gemini-2.5-pro       (needs GOOGLE_API_KEY)
+vlm:
+  vlm_model: claude-opus-4-8
+  # text_embedding_model does MORE than pick a model: MemoryManager.__init__
+  # builds the embeddings filename from it (ltm_<name>.csv), which is the
+  # only thing stopping vectors from one backend being read as another's.
+  #
+  # It must therefore name the model that ACTUALLY produced the vectors.
+  # It said `text-embedding-3-large` (3072-d, OpenAI) while the Claude path
+  # hardcodes all-MiniLM-L6-v2 (384-d, local, claude_vlm_client.py:71) - so
+  # the file was named after a model that never computed its contents.
+  #
+  # Change this only together with re-embedding the LTM: a new name means a
+  # new filename, which means every existing row loses its embedding and
+  # retrieval raises TypeError (see data/ltm/archive/README.md).
+  #
+  # NOTE for the report: MiniLM truncates at 256 word-pieces, and the
+  # scenario key is instruction + full scene description - often longer.
+  # Retrieval is then keyed on a truncated prefix. This is a real deviation
+  # from the paper's 3072-d embeddings and is worth an explicit ablation
+  # rather than a silent difference.
+  text_embedding_model: all-MiniLM-L6-v2
+
+# --- ROS Topics ---
+# Verified against bags/red_cup/metadata.yaml (the only recording we have).
+# Upstream's defaults were /zedxm/... - the ANYmal robot's camera, not ours.
+# Three differences from upstream, all confirmed from the bag:
+#   1. /zedxm/ -> /zed/          (different camera on this robot)
+#   2. color is raw sensor_msgs/Image, NOT CompressedImage - there is no
+#      /compressed topic in the bag at all. scene_observer subscribes with
+#      the type named by color_image_compressed below.
+#   3. camera_info is nested under the image topic
+#      (/rgb/color/rect/image/camera_info), not a sibling /rgb/camera_info.
+topics:
+  color_image: /zed/zed_node/rgb/color/rect/image
+  depth_image: /zed/zed_node/depth/depth_registered
+  camera_info: /zed/zed_node/rgb/color/rect/image/camera_info
+  # true  -> subscribe to color_image as sensor_msgs/CompressedImage
+  # false -> subscribe as sensor_msgs/Image (what our bag actually contains)
+  color_image_compressed: false
