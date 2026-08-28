@@ -50,6 +50,7 @@ loudly rather than falling through to a stale result.
 import argparse
 import io
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -80,6 +81,59 @@ MIN_POINTS = 200        # below this, depth failed on the object
 # Requests may raise the cap to this value instead; it still rejects a
 # degenerate mask that has swallowed the whole image.
 MAX_SURFACE_MASK_FRAC = 0.85
+
+
+# Spatial selectors for picking one of several same-looking detections.
+# All are image-frame: +col is right, +row is DOWN. On a table viewed from
+# the front the nearer object sits LOWER in the frame, so "near" == max row.
+_SPATIAL_SELECTORS = {
+    "left", "right", "near", "far", "top", "bottom", "largest", "smallest",
+}
+# Words a caller might use, mapped onto the canonical selector above.
+_SPATIAL_ALIASES = {
+    "leftmost": "left", "rightmost": "right",
+    "front": "near", "frontmost": "near", "nearest": "near", "closest": "near",
+    "back": "far", "rear": "far", "backmost": "far",
+    "farthest": "far", "furthest": "far",
+    "topmost": "top", "bottommost": "bottom",
+    "biggest": "largest", "closest-to-camera": "near",
+}
+
+
+def _select_spatial(selector: str, masks):
+    """Index of the mask that best matches `selector`, or None if unknown.
+
+    `masks` is (N, H, W) bool. Uses each mask's pixel centroid (and area
+    for largest/smallest). Ties are broken by numpy argmin/argmax order,
+    which is deterministic.
+    """
+    sel = _SPATIAL_ALIASES.get(selector, selector)
+    if sel not in _SPATIAL_SELECTORS:
+        return None
+
+    areas = np.array([int(m.sum()) for m in masks], dtype=np.float64)
+    if sel == "largest":
+        return int(np.argmax(areas))
+    if sel == "smallest":
+        # Ignore empty masks (area 0) - they are not real detections.
+        areas_safe = np.where(areas > 0, areas, np.inf)
+        return int(np.argmin(areas_safe))
+
+    rows = np.zeros(len(masks))
+    cols = np.zeros(len(masks))
+    for i, m in enumerate(masks):
+        ys, xs = np.nonzero(m)
+        if len(ys):
+            rows[i], cols[i] = ys.mean(), xs.mean()
+    if sel == "left":
+        return int(np.argmin(cols))
+    if sel == "right":
+        return int(np.argmax(cols))
+    if sel in ("near", "bottom"):
+        return int(np.argmax(rows))
+    if sel in ("far", "top"):
+        return int(np.argmin(rows))
+    return None
 
 
 class PerceptionServer:
@@ -199,19 +253,60 @@ class PerceptionServer:
             order = np.argsort(confs)[::-1]
             best = int(order[0])
 
+            # Spatial disambiguation. When the scene holds several instances
+            # of the same object (three wooden cubes), the detector scores
+            # them near-equally and the ambiguity guard below would refuse
+            # every one. If the caller passed a `disambiguate` selector
+            # ("left"/"right"/"near"/"far"/"top"/"bottom"/"largest"/
+            # "smallest"), resolve BY GEOMETRY instead of by score - this is
+            # the planner saying which of the identical objects it means.
+            disambiguate = str(req.get("disambiguate", "")).strip().lower()
+            if disambiguate and len(confs) > 1:
+                picked = _select_spatial(disambiguate, masks)
+                if picked is None:
+                    return {"ok": False, "reason":
+                            f"disambiguate={disambiguate!r} is not one of "
+                            f"{sorted(_SPATIAL_SELECTORS)}"}
+                best = picked
+                logger.info("disambiguate=%r picked box %d of %d for %r",
+                            disambiguate, best, len(confs), prompt)
+
             # Ambiguity guard. Two similar scores mean the detector cannot tell
             # the objects apart; picking argmax here is how the e-stop gets
             # grasped. Name BOTH candidates so the VLM can disambiguate.
-            if len(order) > 1:
+            elif len(order) > 1:
                 margin = confs[best] - confs[int(order[1])]
                 if margin < AMBIGUITY_MARGIN:
                     return {"ok": False, "reason":
                             f"ambiguous detection for {prompt!r}: "
                             f"{labels[best]!r} ({confs[best]:.2f}) vs "
                             f"{labels[int(order[1])]!r} ({confs[int(order[1])]:.2f}), "
-                            f"margin {margin:.2f} < {AMBIGUITY_MARGIN}"}
+                            f"margin {margin:.2f} < {AMBIGUITY_MARGIN}. If the scene "
+                            f"has several of the same object, pass a disambiguate "
+                            f"selector ({sorted(_SPATIAL_SELECTORS)})"}
 
             mask = masks[best]
+
+            # DEBUG SAVE (opt-in via PRAGMABOT_DEBUG_SAVE=1). Off by default -
+            # this is purely to let a human inspect whether the mask is
+            # symmetric around the real object or biased to one side (e.g.
+            # a shadow/highlight on a glossy object eating into one face's
+            # pixels), which would bias the computed centroid/extent used
+            # for grasp centering independent of any robot/camera extrinsic
+            # calibration. Saved under /tmp/pragmabot_debug so it survives
+            # across runs without polluting the repo.
+            if os.environ.get("PRAGMABOT_DEBUG_SAVE"):
+                try:
+                    from PIL import Image
+                    dbg_dir = Path("/tmp/pragmabot_debug")
+                    dbg_dir.mkdir(exist_ok=True)
+                    ts = time.strftime("%Y%m%d_%H%M%S")
+                    Image.fromarray(rgb).save(dbg_dir / f"{ts}_rgb.png")
+                    np.save(dbg_dir / f"{ts}_mask.npy", mask)
+                    logger.info(f"debug: saved rgb+mask to {dbg_dir}/{ts}_*")
+                except Exception as exc:  # noqa: BLE001 - diagnostics only
+                    logger.warning(f"debug save failed: {exc}")
+
             frac = float(mask.sum()) / mask.size
             # Callers resolving a placement SURFACE pass the looser bound;
             # everything else keeps the object bound. Same guard, bound

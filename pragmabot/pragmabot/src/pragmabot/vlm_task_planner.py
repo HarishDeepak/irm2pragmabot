@@ -28,7 +28,9 @@ PLANNER_INSTRUCTION_PROMPT = """
 Given the current scene and task, choose the next best action.
 
 HARD CONSTRAINTS TO APPLY:
-  - PUSH IS NOT AVAILABLE on this robot. Only PICK and PLACE are implemented. Never choose PUSH: it will be rejected without moving the arm and the step will be wasted.
+  - PUSH is available and is a non-prehensile shove: the robot closes the gripper and slides the object "left" or "right" (relative to the camera view) along the table. PUSH cannot lift, stack, or place onto another object. For a PUSH action set push_direction to "left" or "right" and do not set placement fields.
+  - To clear an obstacle out of the way of a target object: if the two-finger gripper can grasp the obstacle (any colour, any size within the gripper's range), PICK it up and then PLACE it aside (choose PLACE with target_object set to the obstacle and NO placement_object - this releases it in a clearing area away from the workspace). Prefer this over PUSH for graspable obstacles: a closed-gripper PUSH can clip the obstacle instead of moving it. Use PUSH to clear an obstacle only when it is too wide, round, or soft for the gripper to PICK.
+  - A PLACE with no placement_object means "put the held object down in a clear spot out of the way" - it does NOT place onto any named surface. Only set placement_object when the goal is to put the object on top of a specific surface or object.
   - If the objective is to put an object on top of another object, use PICK and PLACE.
   - If the robot is holding something, it must PLACE that object before attempting to grasp another.
   - When the target object is tiny or flat, which is hard to grasp, you cannot use PICK.
@@ -41,6 +43,7 @@ GENERAL RULES:
   - In the reasoning process, first propose a promising action, then check whether it violates any constraints, one by one. If it does, discard it and propose another. Repeat this until you find a promising action that satisfies all constraints. 
 
 ACTION PARAMETERS:
+  - When the scene contains several objects that look alike (e.g. three wooden cubes) and you mean a specific one, PREFIX target_object with exactly one spatial word so perception can tell them apart: "left", "right", "front" (nearest the camera), "back" (farthest), "top", "bottom", "largest", or "smallest" - for example target_object "left wooden cube". Use this whenever the target or an obstacle is one of several similar objects; without it the action is refused as an ambiguous detection.
   - For the pick up, if the object needs to be grasped at a specific section, you must specify that as well.
   - For the place action, you need to specify which object to place the target object on (not next to). If the object needs to be placed at a specific section, you must specify that as well.
 

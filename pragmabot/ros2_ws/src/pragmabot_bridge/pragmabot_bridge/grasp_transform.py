@@ -219,6 +219,180 @@ def estimate_gripper_width(
     return float(hi - lo)
 
 
+def center_grasp_on_object(grasp_T_cam: np.ndarray, pcd_cam: np.ndarray,
+                           max_shift: float = 0.08,
+                           gripper_depth: float = 0.10527314) -> np.ndarray:
+    """Slide a grasp along its finger-closing axis so the fingers straddle
+    the object symmetrically. Returns a corrected copy of `grasp_T_cam`.
+
+    WHY (measured 2026-08-26, on a real 4.5 cm cube). A single-view depth
+    capture sees only the faces pointing at the camera, so the object
+    cloud is a SHELL, not a solid. Its centroid therefore sits toward the
+    camera by roughly half the unseen depth -- here +8.7 mm. GraspGen
+    recentres the cloud on that centroid before inference, so every grasp
+    it returns inherits the same bias.
+
+    On this cube the effect was decisive: the cube's true midpoint along
+    the finger-closing axis was 0.5299 while the grasp was placed at
+    0.5388. With a half-width of 21 mm, a 9 mm offset lands one finger on
+    the top face and the other outside the far side -- the "one gripper
+    hit the top surface, one is on the side" failure, reproducing on
+    every attempt regardless of tilt, width or calibration.
+
+    THE CORRECTION. Along the finger-closing axis the object's extent
+    midpoint is a far better estimate of its centre than the mass
+    centroid: min and max come from the two silhouette edges, which are
+    both visible even when the interior is not, whereas the centroid is
+    pulled by how many points each face contributed. Only this ONE axis
+    is corrected -- the approach axis is deliberately left alone (depth
+    along it is set by the gripper geometry, not the cloud) and so is the
+    third axis, where an offset merely shifts where along the object the
+    fingers land rather than whether they close on it at all.
+
+    `max_shift` caps the correction so a bad mask (background leaking in,
+    which makes the extent meaningless) cannot fling the grasp across the
+    table. It is deliberately LARGER than any plausible graspable object:
+    an earlier 0.03 cap silently clipped the correction for grasps GraspGen
+    had placed near an object's edge, leaving them 15 mm off centre on a
+    44 mm block -- 2.6 mm of finger clearance, which clipped it on contact.
+    Guard the mask by checking the cloud's EXTENT (a 90 cm "cube" is a bad
+    mask); do not guard it by half-correcting the grasp.
+    """
+    R = grasp_T_cam[:3, :3]
+    t = grasp_T_cam[:3, 3]
+
+    local_x = (pcd_cam - t) @ R[:, 0]
+    shift_x = float(np.clip(0.5 * (local_x.min() + local_x.max()), -max_shift, max_shift))
+
+    # DEPTH, along the approach axis. Skipping this was a real error:
+    # the single-view centroid bias points TOWARD the camera, and for a
+    # near-vertical grasp that is mostly UPWARD, so the grasp sits too
+    # high. Measured on a 42 mm cube: the fingertips reached only 5.9 mm
+    # below its top face, closing on the top edge while the rest of the
+    # cube hung below them. Nothing about the aim was wrong - the grasp
+    # was simply too shallow to have the object between the fingers.
+    #
+    # Target: put the FINGERTIP PLANE (gripper_depth along +Z) at the
+    # object's midpoint along the approach axis, so the fingers span the
+    # upper half of the object. Aiming deeper (at the contact band's own
+    # centre, 0.75 * depth) would put the tips below the object and into
+    # the table on a short object, which is the one failure worse than a
+    # missed grasp.
+    local_z = (pcd_cam - t) @ R[:, 2]
+    object_mid_z = float(0.5 * (local_z.min() + local_z.max()))
+    shift_z = float(np.clip(object_mid_z - gripper_depth, -max_shift, max_shift))
+
+    corrected = grasp_T_cam.copy()
+    corrected[:3, 3] = t + R[:, 0] * shift_x + R[:, 2] * shift_z
+    return corrected
+
+
+def principal_axis_xy(points: np.ndarray):
+    """Longest horizontal axis of a point cloud, and how elongated it is.
+
+    Returns (axis_unit_3, elongation) where axis_unit_3 is a unit vector in
+    the SAME frame as `points` lying in the x/y (table) plane, and
+    elongation is sqrt(lambda0 / lambda1) of the 2D covariance -- 1.0 for a
+    round/square footprint, >1 for a banana/carrot/pen. z is ignored on
+    purpose: the grasp cross-axis preference only cares which way the
+    object is long ACROSS THE TABLE, since the fingers close in a roughly
+    horizontal plane for a top-down grasp.
+    """
+    p = np.asarray(points, dtype=np.float64)[:, :2]
+    p = p - p.mean(axis=0)
+    if len(p) < 3:
+        return np.array([1.0, 0.0, 0.0]), 1.0
+    cov = (p.T @ p) / len(p)
+    vals, vecs = np.linalg.eigh(cov)          # ascending
+    long_2d = vecs[:, -1]
+    elong = float(np.sqrt(max(vals[-1], 1e-12) / max(vals[0], 1e-12)))
+    return np.array([long_2d[0], long_2d[1], 0.0]), elong
+
+
+def _crossaxis_factor(grasps_T_base: np.ndarray, long_axis: np.ndarray,
+                      weight: float) -> np.ndarray:
+    """Per-candidate multiplier in [1-weight, 1] rewarding grasps whose
+    fingers close ACROSS the object's long axis, not along it.
+
+    GraspGen's franka_panda convention: local X is the finger-closing axis
+    (see estimate_gripper_width). We want that axis perpendicular to
+    `long_axis` (grip the banana across its width, not end-to-end). A grasp
+    whose fingers close exactly along the length keeps only `1-weight` of
+    its confidence; a perfectly crosswise one keeps all of it. This is a
+    SOFT re-rank, never a filter -- if every grasp is lengthwise the list
+    still comes back, just reordered.
+    """
+    fx = grasps_T_base[:, :3, 0]                      # finger-closing axis, base frame
+    fx_xy = fx[:, :2]
+    n = np.linalg.norm(fx_xy, axis=1)
+    n[n < 1e-9] = 1e-9
+    fx_xy = fx_xy / n[:, None]
+    la = long_axis[:2] / max(np.linalg.norm(long_axis[:2]), 1e-9)
+    along = np.abs(fx_xy @ la)                        # 1 = along length (bad), 0 = across (good)
+    return 1.0 - weight * along
+
+
+def rank_grasp_indices(grasps_T_base: np.ndarray, confidences=None,
+                       min_confidence: float = 0.0,
+                       max_tilt_deg: float = 0.0,
+                       object_long_axis=None,
+                       crossaxis_weight: float = 0.0) -> np.ndarray:
+    """Every candidate that passes the tilt gate, best-first.
+
+    Same gate and same ordering as select_grasp_index() -- which is now a
+    thin wrapper over this -- but it returns the WHOLE ranked list instead
+    of only the winner, so a caller can walk down it and apply a further
+    test that needs the grasp pose itself.
+
+    `object_long_axis` (+ `crossaxis_weight` > 0) applies a soft re-rank
+    that prefers grasps closing across that axis rather than along it --
+    the fix for elongated objects (banana, carrot), where the highest
+    confidence grasp is often a physically useless end-to-end pinch. Pass
+    None / 0.0 to leave ordering by confidence alone (the cube path).
+
+    WHY THIS EXISTS (measured 2026-08-26). The tilt gate checks the
+    approach ANGLE but says nothing about whether the fingers actually
+    span the object. On a real cube, the winning candidate closed its
+    fingers along the visible surface's normal, and
+    estimate_gripper_width() correctly returned 0.0058 m -- the thickness
+    of the single-view shell, not the 6 cm cube. Commanding that width
+    closes the gripper almost fully and the object is pushed aside
+    instead of grasped. A single winner gives the caller nothing to fall
+    back to; a ranked list lets it skip that candidate and take the next
+    one that both points down AND spans the object.
+
+    Returns an empty array if nothing survives the tilt gate (callers must
+    check, exactly as they must check select_grasp_index()'s -1).
+    """
+    approach_axis = grasps_T_base[:, :3, :3] @ np.array([0.0, 0.0, 1.0])
+    tilt_deg = np.degrees(np.arccos(np.clip(-approach_axis[:, 2], -1.0, 1.0)))
+
+    keep = tilt_deg <= max_tilt_deg if max_tilt_deg > 0.0 else np.ones(len(grasps_T_base), bool)
+    candidates = np.where(keep)[0]
+    if len(candidates) == 0:
+        return candidates
+
+    if confidences is None:
+        return candidates[np.argsort(tilt_deg[candidates])]
+
+    conf = np.asarray(confidences, dtype=np.float64).reshape(-1)
+    if len(conf) != len(grasps_T_base):
+        raise ValueError(f"{len(conf)} confidences for {len(grasps_T_base)} grasps")
+
+    # min_confidence stays best-effort (see select_grasp_index): applied
+    # only while it leaves something, never emptying the tilt survivors.
+    confident = candidates[conf[candidates] >= min_confidence]
+    if len(confident):
+        candidates = confident
+
+    rank_score = conf[candidates]
+    if object_long_axis is not None and crossaxis_weight > 0.0:
+        rank_score = rank_score * _crossaxis_factor(
+            grasps_T_base[candidates], np.asarray(object_long_axis, float),
+            float(np.clip(crossaxis_weight, 0.0, 1.0)))
+    return candidates[np.argsort(-rank_score)]
+
+
 def matrix_to_pose(T: np.ndarray) -> Pose:
     """4x4 homogeneous matrix -> geometry_msgs/Pose."""
     pose = Pose()

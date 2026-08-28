@@ -86,11 +86,28 @@ class LivePerception:
                  perception_port: int = DEFAULT_PERCEPTION_PORT,
                  graspgen_port: int = DEFAULT_GRASPGEN_PORT,
                  timeout_ms: int = 60_000,
-                 grasp_topk: int = 0) -> None:
+                 grasp_topk: int = 0,
+                 num_grasps: int = 1200) -> None:
         self.host = host
         self.perception_port = perception_port
         self.graspgen_port = graspgen_port
         self.timeout_ms = timeout_ms
+        # How many grasps the diffusion model samples per request.
+        #
+        # MEASURED 2026-08-26, and the reason the tilt gate kept finding
+        # nothing: GraspGenClient.infer()'s default samples 200 and returns
+        # the top ~100 BY CONFIDENCE. GraspGen scores enveloping side
+        # grasps above top-down ones, so that confidence cut removes the
+        # near-vertical candidates specifically - not at random. On one
+        # real cube cloud, the default 100 returned NOTHING within 45 deg
+        # of vertical (best 42.9 deg), while 1200 on the same cloud gave 49
+        # candidates within 20 deg, the best at 0.6 deg. The vertical
+        # grasps existed the whole time; they were being discarded before
+        # select_grasp_index ever saw them.
+        #
+        # Costs ~2-3 s more per pick, which is nothing next to the arm
+        # motion that follows.
+        self.num_grasps = num_grasps
         # Keep only the top-K candidates by GraspGen's own confidence
         # before they ever reach select_grasp_index. 0 = no cap (all
         # candidates GraspGen returns, currently ~100). Client-side, not
@@ -101,9 +118,15 @@ class LivePerception:
         self.grasp_topk = grasp_topk
 
     def grasps_for(self, target_object: str, rgb: np.ndarray, depth: np.ndarray,
-                   intrinsics) -> Tuple[Optional[np.ndarray], Optional[np.ndarray],
-                                        Optional[np.ndarray], str]:
+                   intrinsics, disambiguate: str = "",
+                   ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray],
+                              Optional[np.ndarray], str]:
         """Detect `target_object` and generate grasps for it.
+
+        `disambiguate` (optional): when the scene holds several instances of
+        the same object, one of "left"/"right"/"near"/"far"/"top"/"bottom"/
+        "largest"/"smallest" picks which one by image geometry instead of
+        letting the ambiguity guard refuse them all.
 
         Returns:
             (grasps_T_cam, confidences, object_pcd_cam, reason). On success
@@ -113,7 +136,8 @@ class LivePerception:
         if not target_object or not target_object.strip():
             return None, None, None, "no target object was named in the action"
 
-        cloud, reason = self._detect(target_object, rgb, depth, intrinsics)
+        cloud, reason = self._detect(target_object, rgb, depth, intrinsics,
+                                     disambiguate=disambiguate)
         if cloud is None:
             return None, None, None, reason
 
@@ -125,6 +149,28 @@ class LivePerception:
             f"{len(grasps)} grasps for {target_object!r} "
             f"(conf {confs.min():.2f}-{confs.max():.2f})"
         )
+
+    def object_cloud_for(self, target_object: str, rgb, depth, intrinsics,
+                         max_mask_frac: float = 0.60, disambiguate: str = ""):
+        """Detect `target_object` and return only its point cloud.
+
+        The push counterpart of grasps_for(): pushing needs the object's
+        position and extent, not a grasp, so GraspGen is not called. Same
+        detector and the same guards (ambiguity margin, minimum surviving
+        points) as picking, but a looser mask-area ceiling - a push target
+        can legitimately fill more of the frame than a pick target (it is
+        often bigger, and closer to the arm), so the object-sized 40% bound
+        would refuse it.
+
+        Returns:
+            (cloud_cam, reason). cloud_cam is (N, 3) float64 in the camera
+            optical frame, or None on failure; reason is always populated.
+        """
+        if not target_object or not target_object.strip():
+            return None, "no target object was named in the action"
+        return self._detect(target_object, rgb, depth, intrinsics,
+                            max_mask_frac=max_mask_frac,
+                            disambiguate=disambiguate)
 
     # -- placement ----------------------------------------------------
 
@@ -262,7 +308,7 @@ class LivePerception:
 
     # -- stages -------------------------------------------------------
 
-    def _detect(self, target_object: str, rgb, depth, intrinsics):
+    def _detect(self, target_object: str, rgb, depth, intrinsics, **detect_kwargs):
         try:
             PerceptionClient = _import_perception_client()
         except ImportError as exc:
@@ -276,7 +322,7 @@ class LivePerception:
         try:
             with PerceptionClient(self.host, self.perception_port,
                                   timeout_ms=self.timeout_ms) as client:
-                res = client.detect(rgb, depth, intrinsics, prompt)
+                res = client.detect(rgb, depth, intrinsics, prompt, **detect_kwargs)
         except Exception as exc:  # noqa: BLE001
             return None, f"perception request failed: {type(exc).__name__}: {exc}"
 
@@ -314,7 +360,11 @@ class LivePerception:
 
         try:
             with GraspGenClient(host=self.host, port=self.graspgen_port) as gg:
-                grasps, confidences = gg.infer(pcd_centered)
+                grasps, confidences = gg.infer(
+                    pcd_centered,
+                    num_grasps=self.num_grasps,
+                    topk_num_grasps=self.num_grasps,
+                )
         except Exception as exc:  # noqa: BLE001
             return None, None, (
                 f"grasp generation failed: {type(exc).__name__}: {exc} "

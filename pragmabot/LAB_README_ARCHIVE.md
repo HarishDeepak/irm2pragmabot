@@ -22,6 +22,7 @@ container franka:
 echo $ROS_DOMAIN_ID
 echo $DISPLAY
 docker exec -it -e DISPLAY=$DISPLAY franka_ros2_humble bash
+source /ros2_ws/install/setup.bash
 ros2 launch franka_fr3_moveit_config moveit.launch.py robot_ip:=10.10.10.10
 
 in host:
