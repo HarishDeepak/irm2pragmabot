@@ -521,3 +521,391 @@ aborts. Cross-axis grasp helps tolerate it; a matte sheet would help more.
 - Place tray-floor depth reading ~2 cm low was worked around with
   clearance, not root-caused (calibration z? thin tray? point catching
   the table through the tray?).
+
+# 2026-08-28 - hand-seeded an LTM experience (stacked cube -> unstack first)
+
+## What we did and why
+
+We defined a memory entry for the robot's **long-term memory (LTM)** by
+hand. Normally LTM fills itself: after a task completes, the experience
+summarizer turns the short-term memory (STM) into a "lesson" row and
+`save_experience()` writes it to `data/ltm/ltm.csv`. On the next similar
+task the planner retrieves it by cosine similarity and reads it before
+planning - it learns from experience without any fine-tuning.
+
+The problem: our failures are the kind you have to **E-stop** before they
+finish - the arm swinging toward the green cube while a yellow cube is
+stacked on it, about to knock it off or collide. An interrupted run never
+reaches the summarizer, so the robot never records that lesson and repeats
+the mistake next time.
+
+So we wrote the LTM row ourselves - one entry describing the scenario
+(yellow cube stacked on the green cube, instruction "pick up the green
+cube and put it on the blue bowl") and the lesson: the lower cube of a
+stack is not graspable; first PICK the top (yellow) cube, PLACE it onto a
+separate named container (a spare **red bowl**, fallback "next to the
+banana"), then PICK the green cube and PLACE it in the blue bowl. From
+then on the planner retrieves this row and unstacks correctly on the
+first try.
+
+## Mechanics that bit us (record for next time)
+
+- LTM is **two files** merged on the exact `scenario` string:
+  `ltm.csv` (readable) and `ltm_all-MiniLM-L6-v2.csv` (one base64
+  float32 embedding per scenario). A row in `ltm.csv` with **no matching
+  embedding** makes retrieval crash in `sort_values` (NaN similarity,
+  `memory_manager.py:110`). After adding or editing a row you must
+  rebuild the embedding for every changed scenario.
+- The embedding is keyed on `scenario` = `"Instruction: {instr}\nScene:
+  {initial_scene_description}"`, **not** on `experience`. Editing only the
+  lesson text needs no rebuild; editing the scene text does.
+- Embeddings are local: `SentenceTransformer("all-MiniLM-L6-v2").encode`
+  (`claude_vlm_client.get_text_embedding`). We rebuilt the whole
+  embeddings CSV with a ~10-line script. The `manage_memory` Gradio node
+  is **still `rospy` (ROS 1, unported)** and does not run under humble -
+  its "Build missing embeddings" button is not available to us.
+- The planner node loads both CSVs **once at startup** - restart
+  `pragmabot_node.py` after every edit.
+
+## Why the "put it aside" step must name a real object
+
+`panda_skill_executor.py:150` rejects any `place` whose `placement_object`
+is empty, **locally, before the bridge sees it**. The bridge itself has a
+put-aside path (`clearing_zone_xyz` / `place_offset_xyz` when no placement
+object is named - see "clear-obstacle-by-picking" above) but the executor
+guard blocks the planner from ever triggering it.
+
+First run with the note: LTM correctly made the planner pick the yellow
+cube first, but the planner then emitted a place with no target -> the
+executor rejected it -> the planner moved on to "pick green cube" -> the
+bridge opened the gripper for the green grasp and the **yellow cube fell
+out mid-air**. Fix (no code change): the LTM note now tells the planner to
+place the yellow cube onto the **red bowl** (a real, detectable object),
+so the place has a valid `placement_object` and the bridge perceives it
+and releases there.
+
+## Result
+
+With the tightened note and a red bowl placed on the right of the table,
+"pick up the green cube and put it on the blue bowl" (yellow stacked on
+green) ran end to end: PICK yellow -> PLACE yellow on red bowl -> PICK
+green -> PLACE green in blue bowl. Confirmed by the user ("it works").
+
+## What to test next, per the paper (arXiv 2507.16713)
+
+The paper's headline results are two ablations. To reproduce them on our
+rig, pick a fixed set of ~10-15 task instances (stacked-cube, obstruction,
+container-placement, multi-step) and run each under controlled memory
+settings in `config.yaml`, logging **success (Y/N)** and **steps to
+completion (capped at `max_steps`)** for every run - the trial logger
+already records these plus the LTM scenarios retrieved and their
+similarities.
+
+1. **STM self-reflection ablation** (paper: 35% -> 84%). Same tasks,
+   `activate_stm: false` vs `true`, `activate_ltm: false` both times.
+   Measures within-task recovery: does feeding the executor's failure
+   reason back into the planner let it replan and finish the same task.
+   Include a few runs where you deliberately induce a recoverable failure
+   (ambiguous detection, an obstruction) and check the planner adapts
+   instead of repeating the action.
+
+2. **LTM + RAG single-trial ablation** (paper: 22% -> 80% on **unseen**
+   scenarios). Seed LTM from a set of *training* tasks, then test on
+   *new but related* scenarios the robot has never done, first attempt
+   only. Key generalization test for us: after the "yellow on green ->
+   blue bowl" note, does "red cube on blue cube -> orange tray"
+   (no dedicated note) succeed first try by transferring the general
+   "unstack top-down" lesson? Run with `activate_ltm: false` vs `true`.
+
+3. **Retrieval ablation** (paper Fig. 7). `use_random_retrieval: true`
+   vs `false`, and sweep `retrieval_top_k` (e.g. 1, 3, 5, -1). Shows
+   similarity-based retrieval of the *right* experience matters, not just
+   having memory. The logged `ltm_similarities` are the data for this.
+
+4. **Success-detector accuracy** (paper: 5% false positive, 6.67% false
+   negative). Use the Gradio ground-truth control to log a human label
+   for every action alongside the VLM's `vlm_is_action_successful` /
+   `vlm_is_task_completed`, then compute the confusion matrix. This
+   underpins both ablations above - a bad detector breaks the whole loop.
+
+5. **Watch for LTM over-generalization** (our own finding, 2026-08-28
+   lab session, "LTM confirmed working"): single-skill rows that preach
+   "retry the same action unchanged" have derailed multi-step tasks
+   (planner re-issued PUSH while holding a cube). When testing multi-step
+   instructions with LTM on, check the retrieved rows and the planner's
+   `applicable_knowledge` field for this failure mode; prune or re-scope
+   offending rows.
+
+# 2026-08-28 - concrete test scenarios for our object set
+
+Our objects: 4 cubes - **YC** yellow, **RC** red, **GC** green, **WC**
+yellow wooden. Containers - **RB** red bowl, **BB** blue bowl, **TR**
+tray. Also **GP** green bell pepper.
+
+## Detector cautions for THIS set (from earlier sessions - design around them)
+
+- **"green" is overloaded:** GC, GP, and the green-LED device at the back
+  of the table all match the prompt `green`. For any `green cube` task,
+  take GP and the LED device OFF the table, or place GP >15 cm away and
+  use a spatial prefix (`front green cube`).
+- **"yellow" is overloaded:** YC and WC both match `yellow`. Use prompts
+  `yellow cube` vs `yellow wooden cube`, keep them >10 cm apart, add a
+  spatial prefix when both are in frame. WC also reads weakly as
+  `green cube` - don't put WC next to GC without a spatial prefix.
+- **If TR is orange:** do NOT have YC or RC in the same frame as TR when
+  the target prompt is warm-coloured - the tray outscores a small cube on
+  `yellow`/`red` (poisons the cloud -> oversized-cloud abort). Use TR only
+  as a destination for GC, or get a non-orange tray.
+- **Touching objects -> ambiguous-detection abort.** Space all cubes
+  8-10 cm apart unless the scenario is deliberately a clustered-obstacle
+  test (then use the spatial prefix, which bypasses the margin guard).
+- **Bowls are ungraspable** (wide/round) - only PUSH moves a bowl, never
+  PICK.
+- Black ribbed aluminium table = worst-case ZED stereo. Expect noisy
+  clouds; matte cover would help.
+
+## Test 1 - STM self-reflection (paper 35% -> 84%)
+
+Toggle `activate_stm` false vs true, `activate_ltm: false` for both.
+Metric: task completed within `max_steps` (Y/N) + step count. STM's job is
+*within-task* recovery after a failure.
+
+- **1a. Ambiguous detection.** GC with RC touching it (touching on
+  purpose). Instruction: "pick up the green cube and put it in the blue
+  bowl". Expect: first PICK aborts (ambiguous). STM off -> repeats the
+  same PICK and burns all steps. STM on -> planner reads the abort reason
+  and adapts (spatial prefix / waits for reset).
+- **1b. Recoverable grasp failure.** YC alone (glossy - a first grasp
+  often fails on tilt/empty close). Instruction: "pick up the yellow cube
+  and put it on the red bowl". STM on -> planner re-tries with recapture
+  instead of declaring the object ungraspable.
+- **1c. Stack, no LTM.** WC stacked on GC. Instruction: "pick up the
+  green cube and put it in the blue bowl". STM off -> planner likely
+  grabs the bottom cube, knocks WC off, repeats. STM on -> after the
+  first failure feedback it should switch to removing WC first. (This is
+  the same scenario as Test 2 but isolates STM's contribution.)
+
+## Test 2 - LTM + RAG, single-trial on UNSEEN scenarios (paper 22% -> 80%)
+
+The headline test. **Seed set** (2 hand-written LTM rows - keep the
+scene/lesson style of the existing `manual_seed` row; rebuild embeddings
+after):
+- Seed-i (already in `ltm.csv`): YC on GC -> "pick up the green cube and
+  put it on the blue bowl"; park YC on RB.
+- Seed-ii (add): WC on RC -> "pick up the red cube and put it on the
+  tray"; park WC on BB.
+
+**Test set** (never seeded - must succeed by transferring the general
+"a stacked object must be removed top-down onto a separate named
+container, then pick the target" lesson). Run each ONCE with
+`activate_ltm: false`, then ONCE with `true`. First-attempt success + steps.
+
+- **2a.** RC on GC -> "pick up the green cube and put it on the tray."
+  (new top cube, new destination)
+- **2b.** GC on YC -> "pick up the yellow cube and put it in the red
+  bowl." (target is the *bottom* cube, colours swapped vs seeds)
+- **2c.** RC on YC -> "pick up the yellow cube and put it in the blue
+  bowl."
+- **2d. Parking-spot choice.** YC on GC, but only TR and BB on the table
+  (no RB). "pick up the green cube and put it in the blue bowl." Does it
+  park YC on the TR (the only free container) and still put GC in BB?
+- **2e. Two obstacles, not a stack (transfer check).** GC with RC and WC
+  both touching it (side by side, not stacked). "pick up the green cube
+  and put it on the tray." Expect: PICK+PLACE-aside each obstacle onto a
+  free container, then PICK GC. Tests whether the lesson generalises from
+  "on top of" to "in the way of".
+
+Expected pattern if LTM works: 2a-2d near-always succeed first try with
+LTM on, mostly fail (grab the blocked cube) with LTM off.
+
+## Test 3 - Retrieval ablation (paper Fig. 7)
+
+Same Test-2 test set, `activate_ltm: true`, seed set loaded PLUS the ~8
+existing pick/place rows as distractors.
+
+- **3a.** `use_random_retrieval: true` vs `false`. Random often pulls a
+  plain pick/place row instead of a stack row -> success should drop
+  toward the LTM-off baseline.
+- **3b.** `retrieval_top_k` in {1, 3, 5, -1}. Check the logged
+  `ltm_similarities` and `ltm_retrieved_scenarios`: does the stacked-cube
+  seed row actually rank top for a stacked-cube query? At `top_k: 1` the
+  wrong row at rank 1 should hurt; at `-1` (everything) the planner may
+  drown in irrelevant rows.
+
+## Test 4 - Success-detector accuracy (paper 5% FP / 6.67% FN)
+
+For EVERY action in every run above, enter a human ground-truth label via
+the Gradio control, then compute the confusion matrix against
+`vlm_is_action_successful` / `vlm_is_task_completed`. Deliberately include
+hard cases:
+- cube grasped then slips out during transport (FN risk),
+- cube placed but rolls off the tray / lands on the rim (FP risk),
+- after removing the top cube: is "pick green cube" scored correctly even
+  though the scene still contains several cubes and a just-parked cube.
+
+## Test 5 - LTM over-generalization on multi-step tasks
+
+`activate_ltm: true`, seed set + distractors loaded.
+
+- **5a.** "push the red bowl left, then pick up the green cube and put it
+  on the tray" (GC clear, RB in the way). Watch `applicable_knowledge` /
+  `chain_of_thought` for an injected "retry the same PUSH unchanged" line
+  making the planner re-PUSH while holding GC (the 2026-08-27 failure).
+- **5b.** WC on GC, instruction: "pick up the green cube and put it on
+  the tray, then pick up the red cube and put it in the blue bowl."
+  Checks that the unstack lesson fires for sub-goal 1 without breaking
+  the pick-place-pick-place sequencing for sub-goal 2.
+
+## Bonus - grasp generality (not a paper metric)
+
+GP (green bell pepper): "pick up the green bell pepper and put it in the
+red bowl." Exercises the cross-axis grasp preference (2026-08-28 lab
+session) on a non-cube shape. Watch for the "Elongated object" log line
+and whether the grasp closes across the short axis. GP and GC must not be
+on the table together (both match `green`).
+
+## Suggested order
+
+Test 4 labelling runs alongside everything else (no extra runs - just log
+the human label each time). Do Test 1, then Test 2 (the core result),
+then Test 3, then Test 5. Fix a per-scenario object layout on paper before
+starting so runs are comparable across the on/off toggles.
+
+NOTE: Test 4 has **no UI button** yet - `TrialLogger.label_step()` exists
+but nothing in the Gradio interface calls it. Either wire a button or
+record human labels on paper and merge later. Do not start with Test 4.
+
+## RECOMMENDED STARTING POINT (2026-08-28)
+
+Start with **Test 2**, in this exact order:
+
+**Fixed settings for the whole of Test 2** (`config.yaml`):
+`activate_stm: true`, `save_to_ltm: false` (so test runs do NOT append
+new rows and pollute the LTM set), only `activate_ltm` is toggled.
+Restart `pragmabot_node.py` after every config change.
+
+**Stage A - the seeded scenario, A/B (confirms the mechanism).**
+Layout: GC on the table centre-right, YC stacked on GC (tower); BB empty
+on the left; RB empty on the right. OFF the table: RC, WC, GP, the green
+LED device (and TR if it is orange). Instruction:
+`pick up the green cube and put it on the blue bowl`.
+Run 5x with `activate_ltm: false`, then 5x with `activate_ltm: true`.
+Success = task completes within `max_steps` with NO human reset / physical
+intervention. Expect: mostly fail with LTM off (grabs the blocked GC),
+mostly succeed with LTM on (removes YC first).
+
+**Stage B - one unseen scenario (confirms generalisation).**
+Scenario 2c: RC stacked on YC; BB empty (destination); RB empty (parking).
+OFF the table: GC, WC, GP, LED (and TR if orange). Instruction:
+`pick up the yellow cube and put it in the blue bowl`.
+Same 5x + 5x. This is NOT in `ltm.csv`; success with LTM on = the general
+"unstack top-down" lesson transferred.
+
+Only after Stage A + B show a clear gap, scale to 10x per condition and
+add 2a / 2b / 2d / 2e.
+
+## Stage B first result (2026-08-28 ~15:17) - PLANNING generalisation CONFIRMED
+
+Ran an unseen stack: yellow cube on the bottom, a red cube (perceived as
+"orange cube" by the VLM) on top; red bowl left, blue bowl right.
+Instruction: "pick up the yellow cube and put it on the red bowl".
+
+**The planner generalised the lesson correctly** (this is what the paper's
+LTM metric measures - "Learning to Plan Tasks"). time_step 1
+`applicable_knowledge`: "This matches past stacked-cube scenarios where the
+named target cube was the LOWER cube of a tower ... unstack top-down: first
+PICK the top (orange) cube and PLACE it in ... an empty bowl ... then PICK
+the exposed yellow cube". `chosen_skill: pick`, `target_object:
+orange cube` (the TOP cube). It did NOT go straight for the yellow cube.
+Record this run as a **planning success** for Test 2 Stage B.
+
+**Execution then failed - separate axis, not the memory system:**
+1. **Tilted approach into a tight tower aborted.** GraspGen's "orange
+   cube" cloud came back 5.0 x **10.5** x 6.9 cm - contaminated with the
+   yellow cube beneath it (a single ZED view cannot separate the two
+   stacked cubes in depth). It selected a **24.8 deg** tilted grasp
+   (passes the 30 deg gate) and `Cartesian approach execution failed -
+   aborting` - the tilted descent into the 2-cube tower has no valid
+   path / clips the lower cube.
+2. **Ambiguous detection.** Retry: GroundingDINO returned two "orange
+   cube" boxes (0.48 / 0.41, margin 0.06) - the yellow cube also reads as
+   "orange". Planner recovered with `top orange cube` (disambiguate=top),
+   detection conf dropped to 0.38.
+3. **Gripper faulted at 15:18:58** ("Gripper homing failed - end effector
+   not connected/faulted"). EVERYTHING after that point is just this -
+   ~8 identical failures. Must reset in Desk.
+4. **Success-detector FALSE POSITIVE.** After the aborted grasp in (1),
+   the detector reported `is_action_successful: true` ("the orange cube
+   appears to have been engaged/lifted by the gripper") when nothing was
+   grasped. One data point for Test 4.
+
+### Takeaways for the next Stage B attempt
+
+- **Picking the TOP cube of a tight stack is the execution bottleneck,
+  not planning.** Single-view segmentation merges the two cubes; the
+  grasp is planned on a 2-cube blob and comes out tilted.
+- Use a top cube in a colour GroundingDINO separates cleanly from the
+  bottom one. Our "red" cube reads as "orange", and orange/yellow are not
+  separable. **Green cube on top of yellow** (green vs yellow is clean) is
+  the better unseen stack.
+- Offset the top cube so ~1 cm overhangs one edge - gives the gripper
+  side clearance and a cleaner partial view of the top cube alone.
+- Consider lowering `max_grasp_tilt_deg` (30 -> ~15) *for the unstack
+  pick only* so a near-vertical grasp is forced on the top cube; risk is
+  "no usable grasp" if GraspGen has nothing vertical on the blob.
+- The clean fix is multi-view point-cloud capture (already listed as the
+  big open item) - a second camera angle separates stacked cubes in
+  depth.
+
+## Grasp landing ~2 mm low across all objects (2026-08-28)
+
+User ran green bell pepper on top of yellow cube, LTM on. **Planner
+generalised again** - recognised the pepper as the blocking top object,
+planned pepper-first. Execution issue reported: grasps land slightly low
+("from the bottom") on every object.
+
+Two levers, different scope:
+1. **Global 2 mm bump - DONE.** `bridge_node.py` `calib_correction_z`
+   default `0.006 -> 0.008`. Additive z on `T_base_from_cam`, so it lifts
+   pick + place + push uniformly. Safe: place has 40 mm `place_clearance_m`.
+   Restart the bridge to pick it up. Revert = set back to 0.006 (or 0.0
+   for raw calibration). Still a one-sample eyeball, not a touch-test.
+2. **Tall objects grasp low regardless - NOT changed.** The table-anchored
+   grasp depth targets the fingertips at
+   `table_z + clip(grip_height_fraction * object_height, 0.008, 0.022)`
+   (bridge_node.py ~line 710, `grip_height_fraction` default 0.35). The
+   **0.022 m ceiling** means anything taller than ~63 mm is gripped in its
+   lower third - a 70-80 mm bell pepper is grasped ~25-30 mm above the
+   table, i.e. near its base. The 2 mm calib bump barely touches this. If
+   the pepper still grasps too low after lever 1, raise the clip ceiling
+   (0.022 -> ~0.035) and/or `grip_height_fraction` (0.35 -> 0.45).
+
+## Merged-stack grasp depth: top cube always hit (2026-08-28, FIXED)
+
+Green cube on top of yellow cube. Bridge log: `object extent 5.0 x 10.6 x
+6.9 cm`, `object top z=0.1200 ... fingertips targeted at z=0.0270 (93 mm
+of grip)` -> `Cartesian approach execution failed` every attempt.
+
+Cause: segmentation cannot separate two touching stacked cubes, so the
+"green cube" cloud is the **whole 10.6 cm column**. The table-anchored
+grasp-depth logic then treats it as one object and targets the fingertips
+2.7 cm above the table - which is **inside the bottom yellow cube**. The
+gripper drives 9.3 cm down through the green cube into the stack.
+
+Fix (`bridge_node.py`, grasp-depth block ~line 712): new param
+**`max_grip_depth_m` (default 0.045)**. The fingertip target is now
+bounded so it is never more than one item-height below the perceived
+object top: `_tip_target = max(table_anchored_target, _top -
+max_grip_depth_m)`. For the merged-stack case this lifts the target from
+z=0.027 to z=0.075 (inside the green cube). Isolated normal cubes are
+unaffected (their table-anchored target is already within 45 mm of the
+top). Genuine tall objects (bottle, bell pepper) are now gripped ~45 mm
+below their top instead of near the base - safer hold anyway. Log line
+says `anchored to the object top (merged/tall cloud)` when the cap fires.
+Also see the **calib_correction_z 0.006 -> 0.008** bump above (separate,
+smaller, global).
+
+Still open: the tilted approach (20.5 deg here) into a tower can still
+clip even with correct depth; physically offsetting the top cube ~2 cm to
+overhang one edge (workaround "A") mitigates both. Real fix = multi-view
+capture.

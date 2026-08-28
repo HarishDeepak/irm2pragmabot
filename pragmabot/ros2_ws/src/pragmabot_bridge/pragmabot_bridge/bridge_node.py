@@ -366,6 +366,17 @@ class PragmabotBridge(Node):
         # height. 0.35 puts the fingers well into the object's lower half
         # while keeping the tips clear of the tabletop.
         self.declare_parameter("grip_height_fraction", 0.35)
+        # Hard cap on how far BELOW the perceived object top the fingertips
+        # may be driven, regardless of the table-anchored target above.
+        # The table anchor assumes the whole cloud is one object; when
+        # segmentation merges a stacked pair into one tall column (two
+        # touching cubes -> a 10 cm "object"), the table anchor aims into
+        # the LOWER item and the gripper drives through the top one. This
+        # bound keeps the target within one item-height of the top, so a
+        # merged/tall cloud is still grasped near its top. 45 mm ~= one
+        # cube. Also lifts genuine tall-object grasps (bottle, pepper) off
+        # their base, which is the safer place to hold them anyway.
+        self.declare_parameter("max_grip_depth_m", 0.045)
         # --- Empirical calibration correction (see execute_pick, applied to
         # T_base_from_cam right after the TF lookup) - measured 2026-08-26
         # via a hand-guided touch-test against fr3_zed_right.calib: bias was
@@ -374,7 +385,10 @@ class PragmabotBridge(Node):
         # keep missing in a consistent direction after this correction.
         self.declare_parameter("calib_correction_x", -0.003)
         self.declare_parameter("calib_correction_y", -0.030)
-        self.declare_parameter("calib_correction_z", 0.006)
+        # z bumped 0.006 -> 0.008 (2026-08-28): grasps were landing ~2 mm
+        # low across all objects by visual inspection. Still one-sample
+        # eyeballed, not a touch-test number.
+        self.declare_parameter("calib_correction_z", 0.008)
         # --- Table collision object -------------------------------------
         # MoveIt starts with an EMPTY world: no table, no obstacles. Every
         # plan to the standoff pose was therefore free to route the arm
@@ -708,6 +722,15 @@ class PragmabotBridge(Node):
                 _frac = float(self.get_parameter("grip_height_fraction").value)
                 _tip_target = _table + float(np.clip(_frac * _height, 0.008, 0.022))
 
+                # Never drive the fingertips more than one item-height below
+                # the perceived top. Guards the merged-stack case where the
+                # table anchor would aim into the cube underneath.
+                _max_depth = float(self.get_parameter("max_grip_depth_m").value)
+                _top_bounded = _top - _max_depth
+                _capped = _top_bounded > _tip_target
+                if _capped:
+                    _tip_target = _top_bounded
+
                 _depth = 0.10527314
                 _fixed = grasps_T_base.copy()
                 for _i in range(len(_fixed)):
@@ -719,8 +742,9 @@ class PragmabotBridge(Node):
                     _fixed[_i, :3, 3] = _fixed[_i, :3, 3] + _a * _s
                 grasps_T_base = _fixed
                 self.get_logger().info(
-                    f"Grasp depth anchored to the table: object top z={_top:.4f}, "
-                    f"table z={_table:.4f}, fingertips targeted at z={_tip_target:.4f} "
+                    f"Grasp depth anchored to the {'object top (merged/tall cloud)' if _capped else 'table'}: "
+                    f"object top z={_top:.4f}, table z={_table:.4f}, "
+                    f"fingertips targeted at z={_tip_target:.4f} "
                     f"({(_top - _tip_target) * 1000:.0f} mm of grip)"
                 )
             except Exception as exc:  # noqa: BLE001 - never block a pick

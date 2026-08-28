@@ -9,9 +9,9 @@ gradio_share: false
 max_steps: 10
 
 # --- Memory Settings ---
-activate_stm: true
+activate_stm: false
 activate_ltm: false
-save_to_ltm: true
+save_to_ltm: false
 use_random_retrieval: false
 retrieval_top_k: 5  # -1 for everything (unsorted)
 
