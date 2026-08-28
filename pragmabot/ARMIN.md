@@ -909,3 +909,33 @@ Still open: the tilted approach (20.5 deg here) into a tower can still
 clip even with correct depth; physically offsetting the top cube ~2 cm to
 overhang one edge (workaround "A") mitigates both. Real fix = multi-view
 capture.
+
+## Merged-stack grasp FIX confirmed + planner skips the parking place (2026-08-28 16:01)
+
+Bell pepper on top of yellow cube, LTM on, bridge restarted with fixes
+A+B.
+
+- **Fix B confirmed working.** `pick 'green flower object'` (the planner's
+  own prompt for the pepper): `Grasp depth anchored to the object top
+  (merged/tall cloud) ... 45 mm of grip`, tilt 9.9 deg, arrival 1.5 mm,
+  `success=True`. The top object of a stack is now grasped cleanly.
+- **New failure: the planner picked the pepper then went straight to
+  `pick 'yellow cube'` - it never placed the pepper.** No place goal
+  reached the bridge between the two picks -> the pepper was dropped when
+  the yellow-cube pick opened the gripper. Root cause: the seeded note
+  named the **red bowl** as the parking spot, but in this task the red
+  bowl is the yellow cube's destination, so the advice was
+  self-contradictory and the planner emitted no usable place.
+- **The yellow-cube pick then stalled:** `ExecuteTrajectory returned no
+  result within 120s ... If the robot is in User Stop, release it and
+  check Desk`. Robot-state issue, separate - check Desk.
+
+Fix applied (LTM note only, scenario text unchanged -> no embedding
+rebuild): rewrote the note so the parking step is GENERAL - "PLACE the
+removed top object onto a real camera-detectable empty container that is
+NOT the final destination; pick it from what is in the scene (an empty
+bowl that is not the destination, else the tray, else beside a distinct
+object)". Added an explicit lesson: "immediately after picking the top
+object the very next action MUST be a PLACE of it onto a named container -
+do not pick anything else while holding it - this is the most common
+failure for this task."
