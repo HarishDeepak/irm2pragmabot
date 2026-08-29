@@ -509,6 +509,10 @@ class PragmaBot:
             self.conversation_log.clear()
             self.display_index = 0
             self.time_step = 0
+            # Clear the executor's gripper-occupancy latch so a new task
+            # does not inherit "holding" from an aborted previous one.
+            if getattr(self, "executor", None) is not None:
+                self.executor.reset()
             return
 
         def update_chat(chatbot):

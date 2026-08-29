@@ -939,3 +939,134 @@ object)". Added an explicit lesson: "immediately after picking the top
 object the very next action MUST be a PLACE of it onto a named container -
 do not pick anything else while holding it - this is the most common
 failure for this task."
+
+## Hard occupancy guard - deterministic fix for "stacked object released" (2026-08-28)
+
+The LTM note above is only a soft nudge and the planner kept skipping the
+parking place. Added a real backstop in `panda_skill_executor.py`:
+
+- New latch `self._holding` (bool). Set True after a successful `pick`,
+  False after a successful `place`. `reset()` clears it; called from
+  `pragmabot_node.py init_task()` at the start of every task.
+- In `execute()`: if `skill in ("pick","push")` and `self._holding`, the
+  goal is REJECTED before the robot moves, with the message
+  "gripper is already holding an object from the previous pick - cannot
+  <skill>. PLACE the held object first, onto a real container that is NOT
+  the final destination ...". That text lands in STM, so the planner
+  self-reflects and re-plans a `place`.
+- The latch updates only on a confirmed `success` from the bridge.
+
+Effect: the planner physically cannot execute "pick the target" while
+still holding the removed top object. Worst case if a picked object
+silently slips: one wasted `place` on an empty gripper, no drop, and the
+success detector/STM notice the object is missing. Both files are
+fork-owned (not on CLAUDE.md's frozen list); restart `pragmabot_node.py`
+to load. Bridge unchanged.
+
+### The guard exposed a config error: activate_stm was FALSE
+
+First run with the guard: pepper picked and HELD (good, no drop), then the
+planner chose `pick 'yellow cube'` every step for 10 steps, each rejected
+by the guard, -> `max_steps` abort. Root cause: `config.yaml`
+`activate_stm: false`. With STM off the planner has NO memory between
+steps - it never knows it already picked the pepper, and the guard's
+"place it first" message is written via `append_to_stm_if_activated()`
+which is a no-op when STM is off. So every step it sees the exposed yellow
+cube and re-picks it.
+
+This also explains ALL the earlier "object released" runs - they were all
+`activate_stm: false`. The planner was amnesiac; it picked the top object,
+then next step picked the target with no memory of holding anything, and
+the gripper-open dropped it. The guard now stops the physical drop but the
+task still cannot complete without STM.
+
+Fix: `activate_stm: true` (set 2026-08-28). Multi-step manipulation is
+impossible with STM off - STM carries the within-task state ("I am holding
+X"). The paper's LTM ablation (Test 2) is run with STM ON; LTM adds to the
+full system, it does not replace STM. Test 1's "STM off" arm is EXPECTED
+to fail multi-step tasks like this - that is what it measures.
+
+## SESSION SUMMARY - 2026-08-28 afternoon: unseen stacked-object task working end to end
+
+**Result:** with STM + LTM both on, "pick up the yellow cube and put it on
+the red bowl" where a **green bell pepper is stacked on the yellow cube**
+(a scenario NOT in ltm.csv) ran to completion on hardware: the robot
+recognised the pepper as the blocking top object, PICKed it, PLACEd it on
+a spare container (not the destination), PICKed the now-exposed yellow
+cube, and PLACEd it in the red bowl.
+
+This is a Test 2 (LTM + RAG) generalisation success - the planner
+transferred the hand-seeded "yellow-on-green cube" unstack lesson to a
+different top object (a pepper), a different colour pairing, and a
+different destination.
+
+### What it took (all changes this session)
+
+1. **Hand-seeded one LTM row** (`ltm.csv`, provenance `manual_seed`):
+   yellow cube on green cube -> "pick the green cube, put on blue bowl",
+   with the lesson "if the target has an object stacked on it, PICK the
+   top object first, PLACE it on a separate named container that is NOT
+   the destination, THEN pick the target". Needed because our stacked
+   failures get E-stopped before the summariser can record them. Embedding
+   rebuilt with a local script (the `manage_memory` Gradio node is still
+   ROS 1 / unported). See the "hand-seeded an LTM experience" section
+   above and the "ltm-seeding-workflow" notes.
+
+2. **`calib_correction_z` 0.006 -> 0.008** (`bridge_node.py`): grasps
+   landed ~2 mm low across all objects by visual inspection. Global,
+   uniform, revertible.
+
+3. **`max_grip_depth_m` new param, default 0.045** (`bridge_node.py`
+   grasp-depth block): single-view segmentation merges two touching
+   stacked cubes into one ~10 cm "object"; the table-anchored grasp depth
+   then aimed the fingertips INTO the lower cube ("93 mm of grip") and the
+   gripper drove through the top cube every attempt. The new cap keeps the
+   fingertip target within one item-height of the perceived object top, so
+   a merged/tall cloud is grasped near its top instead. Isolated normal
+   cubes unaffected; tall objects (pepper, bottle) now held ~45 mm below
+   their top rather than at the base.
+
+4. **Hard occupancy guard** (`panda_skill_executor.py` + `init_task()` in
+   `pragmabot_node.py`): `self._holding` latch, set on a successful
+   `pick`, cleared on a successful `place`, reset per task. A `pick` or
+   `push` while holding is rejected before the robot moves, with a message
+   telling the planner to place first. Deterministic backstop for the LTM
+   note - the planner physically cannot pick the target while still
+   holding the removed top object.
+
+5. **`activate_stm: false` -> `true`** (`config.yaml`): the real reason
+   objects were being "released". With STM off the planner had no memory
+   between steps, never knew it was holding the removed object, and the
+   guard's feedback (written to STM) was a no-op. Turning STM on closed
+   the loop.
+
+6. **LTM note generalised** (`ltm.csv`, experience text only, no embedding
+   rebuild): parking step changed from "place on the red bowl" (which is
+   sometimes the destination) to "place on any real empty container that
+   is NOT the destination - a spare bowl, the tray". Added the lesson
+   "immediately after picking the top object the next action MUST be a
+   PLACE onto a named container; do not pick anything else while holding
+   it".
+
+### Known remaining limits
+
+- Tight tower + tilted grasp can still fail the Cartesian approach even
+  with the depth cap; physically offsetting the top object ~2 cm to
+  overhang one edge (workaround "A") mitigates. Real fix = multi-view
+  point-cloud capture.
+- Detector still confuses warm colours (our "red" cube reads as "orange";
+  orange/yellow inseparable; green cube vs green pepper vs green LED all
+  match "green"). Keep same-family colours off the table together or use
+  a spatial prefix.
+- Franka Hand faulted several times mid-session ("Gripper homing failed")
+  - unrelated to these changes; reset in Desk each time.
+- Success detector gave at least one false positive (reported an aborted
+  grasp as successful) - a Test 4 data point.
+
+### Config to run the LTM stacked-object demo
+
+`config.yaml`: `activate_stm: true`, `activate_ltm: true`,
+`save_to_ltm: false` (keeps the LTM set frozen during tests),
+`retrieval_top_k: 5`. Bridge: defaults are fine after this session's
+edits. Scene: put a spare empty container (not the destination) on the
+table as a parking spot.

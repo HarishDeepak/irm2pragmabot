@@ -72,6 +72,14 @@ class PandaSkillExecutor:
         self.node = node
         self._client = ActionClient(node, ExecuteSkill, "/pragmabot/execute_skill")
 
+        # Gripper-occupancy latch. Set True after a successful `pick`, back
+        # to False after a successful `place`. Used to hard-reject a second
+        # `pick` while the hand is still holding something - without this,
+        # the planner's "pick the target" step after an unstack executes a
+        # real pick, whose gripper-open drops the object still in hand
+        # (the "stacked object is released" bug). reset() clears it per task.
+        self._holding = False
+
         logger.info("Waiting for /pragmabot/execute_skill action server...")
         if not self._client.wait_for_server(timeout_sec=SERVER_WAIT_S):
             raise RuntimeError(
@@ -80,6 +88,10 @@ class PandaSkillExecutor:
                 "Check with: ros2 action list | grep execute_skill"
             )
         logger.info("Connected to /pragmabot/execute_skill")
+
+    def reset(self) -> None:
+        """Clear per-task state. Call at the start of every new task."""
+        self._holding = False
 
     @staticmethod
     def _require(action, field: str):
@@ -154,6 +166,20 @@ class PandaSkillExecutor:
         if not goal.target_object:
             return _result(False, f"{skill} action has empty target_object - planner did not set it")
 
+        # Hard occupancy guard. If the last successful action was a `pick`
+        # with no `place` since, the hand is still holding that object -
+        # executing another `pick` (or `push`) would open the gripper and
+        # drop it. Refuse before moving the robot and tell the planner to
+        # place first. This is the deterministic backstop for the LTM
+        # note's "place the removed object before picking the target".
+        if skill in ("pick", "push") and self._holding:
+            return _result(
+                False,
+                f"gripper is already holding an object from the previous pick - cannot {skill}. "
+                "PLACE the held object first, onto a real container that is NOT the final "
+                "destination (a spare bowl or the tray), then continue.",
+            )
+
         logger.info(
             "Sending %s goal: target=%r placement=%r push_dir=%r",
             skill,
@@ -161,7 +187,16 @@ class PandaSkillExecutor:
             goal.placement_object,
             goal.push_direction,
         )
-        return self._send_and_wait(goal, skill)
+        result = self._send_and_wait(goal, skill)
+
+        # Update the occupancy latch only on a confirmed success.
+        if result.get("success"):
+            if skill == "pick":
+                self._holding = True
+            elif skill == "place":
+                self._holding = False
+
+        return result
 
     def _send_and_wait(self, goal, skill: str) -> dict:
         """Send one goal and block until result, rejection, or timeout."""
