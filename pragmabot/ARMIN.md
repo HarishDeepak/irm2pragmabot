@@ -1070,3 +1070,84 @@ different destination.
 `retrieval_top_k: 5`. Bridge: defaults are fine after this session's
 edits. Scene: put a spare empty container (not the destination) on the
 table as a parking spot.
+
+---
+
+# 2026-08-30 — paper Section D: memory retrieval strategy ablation (NOT run yet)
+
+This is a distinct experiment from Test 1/2/3 above and from the
+README's `test1_stm_ablation.csv` protocol — it is not on `experiments/`
+yet. Test 3 above (line ~721) reuses the stacked-cube task *set*; this
+one reproduces the paper's own Section D / Fig. 7 numbers directly,
+which are about **retrieval strategy**, not about whether LTM is on.
+
+## What the paper measures
+
+Across 12 short pick/move tasks (`Put apple`, `Move candy`, `Move egg`,
+`Pick plate`, `Put ball`, `Put orange`, `Move paper`, `Move screw`,
+`Move sushi`, `Move grape`, `Pick carton`, `Pick towel`), for **each
+task** it scores only the **first planned action** (no execution, no
+multi-step run) against three retrieval strategies, reusing the same
+LTM from their Section V-C:
+
+- **rand** — `k=5` random memories. Worst: 17% first-action accuracy on
+  unseen tasks — irrelevant experiences retrieved by chance.
+- **all** — the entire LTM dumped into the prompt. 74% — better, but
+  noisy/unstable (matches the "long noisy context degrades LLM focus"
+  citation [38],[39]).
+- **rag** — top-k by similarity (what this project actually implements
+  in `memory_manager.py`). Best: 89%.
+
+They also compare `gpt-4o` vs `gpt-4o-mini` under all three settings
+(`rag-4o`, `all-4o`, `rand-4o`, `rag-mini`, `all-mini`, `rand-mini`) and
+report **prompt token count** and **response time** per setting — full
+LTM inflates prompt tokens 7.5x over RAG, at higher latency/cost. The
+mini model is more conservative and gains less from good retrieval than
+the full-size model.
+
+## Mapping onto our config
+
+`config.yaml` already has the exact two knobs needed:
+`use_random_retrieval` and `retrieval_top_k` (`-1` = everything), wired
+into `memory_manager.py:85` (`retrieve(..., top_k, use_random_retrieval)`).
+
+| condition | activate_stm | activate_ltm | use_random_retrieval | retrieval_top_k |
+|-----------|-------------|--------------|-----------------------|------------------|
+| rand      | true        | true         | true                  | 5                |
+| all       | true        | true         | false                 | -1               |
+| rag       | true        | true         | false                 | 5                |
+
+(`activate_stm` fixed true in all three — this experiment varies
+retrieval, not STM. `save_to_ltm: false` throughout, same rule as every
+other eval run, so the LTM set stays frozen.)
+
+## What is NOT yet in this repo for this test
+
+- No task set matching the paper's 12 (apple/candy/egg/etc.) — would
+  need our own equivalent set (our object inventory: YC/RC/GC/WC cubes,
+  RB/BB/TR containers, GP pepper — see the "concrete test scenarios"
+  section above) sized similarly (~12 short single-object tasks).
+- No "score first action only, don't execute" harness — every existing
+  test above runs the task to completion on hardware. This one only
+  needs one `plan_action()` call per task per condition, graded by hand
+  against what the correct first action should be (pick vs push,
+  correct target_object) — cheaper to run than a full hardware trial,
+  no robot motion required.
+- No token-count / response-time logging hooked up yet for this
+  comparison specifically (the VLM client presumably has the response
+  object with usage — needs checking, not confirmed this session).
+- We are on Claude/Gemini per `config.yaml`'s `vlm_model` options, not
+  GPT-4o/4o-mini — the mini-vs-full-size comparison would need a
+  same-family substitute (e.g. a Claude/Gemini small-vs-large pair) and
+  should be reported as a platform difference from the paper, not a
+  like-for-like reproduction.
+
+## Suggested first step
+
+Reuse the Test 3 stacked-cube test set (2a-2e, already defined above)
+plus a few plain non-stacked pick/place tasks to reach ~12, run each
+task's **first `plan_action()` call only** under the three config rows
+above, hand-grade against the expected first action, and compute
+accuracy per condition — same shape as the paper's Fig. 7 left two
+radar charts, without the token/latency columns until those are wired
+up.

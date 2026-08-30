@@ -10,7 +10,7 @@ max_steps: 10
 
 # --- Memory Settings ---
 activate_stm: true
-activate_ltm: true
+activate_ltm: false
 save_to_ltm: false
 use_random_retrieval: false
 retrieval_top_k: 5  # -1 for everything (unsorted)
@@ -20,7 +20,7 @@ retrieval_top_k: 5  # -1 for everything (unsorted)
 # Anthropic: vlm_model: claude-opus-4-8     (needs ANTHROPIC_API_KEY)
 # Gemini:   vlm_model: gemini-2.5-pro       (needs GOOGLE_API_KEY)
 vlm:
-  vlm_model: claude-opus-4-8
+  vlm_model: claude-sonnet-5    #claude-opus-4-8
   # text_embedding_model does MORE than pick a model: MemoryManager.__init__
   # builds the embeddings filename from it (ltm_<name>.csv), which is the
   # only thing stopping vectors from one backend being read as another's.
