@@ -1,6 +1,3 @@
-# Lab README — Archive (full version, up to 2026-07-27)
-echo 'export ANTHROPIC_API_KEY="REDACTED-ROTATE-THIS-KEY"' >> ~/.bashrc
-source ~/.bashrc
 
 echo $ANTHROPIC_API_KEY
 > This is the longer, earlier version of the lab notebook (376 lines).
