@@ -1,0 +1,24 @@
+{
+  "image_path": "/home/harish/irm2pragmabot/pragmabot/extracted/spray_bottle_20260902_171131/rgb.png",
+  "prompt": "spray bottle.",
+  "select": "best",
+  "detections": [
+    {
+      "class_name": "spray bottle",
+      "bbox_xyxy": [
+        664.5792236328125,
+        156.94882202148438,
+        718.3377685546875,
+        302.183349609375
+      ],
+      "score": 0.6057143211364746,
+      "segmentation_rle": {
+        "size": [
+          720,
+          1280
+        ],
+        "counts": "nTe>j0de0d0\\Ob0_Ob0]O<E4M1N3M2N2O1N101O0O2O1O1N4M4L5K6J5K2N1O1O0001O0001O01O0O2O1O002M2O1N3L4XOo]OkLZb0i2V1B:F7I:F<D:E<D7Hhc[<"
+      }
+    }
+  ]
+}

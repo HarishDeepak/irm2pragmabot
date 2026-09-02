@@ -1,0 +1,24 @@
+{
+  "image_path": "/home/harish/irm2pragmabot/pragmabot/extracted/green_pepper_20260902_173202/rgb.png",
+  "prompt": "green bell pepper.",
+  "select": "best",
+  "detections": [
+    {
+      "class_name": "green bell pepper",
+      "bbox_xyxy": [
+        703.6604614257812,
+        173.82798767089844,
+        758.6237182617188,
+        235.39976501464844
+      ],
+      "score": 0.6237483620643616,
+      "segmentation_rle": {
+        "size": [
+          720,
+          1280
+        ],
+        "counts": "Zc`?8Sf0;H6J4M2N2M3N2M3M2O2N2N2N1O2O1N2O001O00001O00O10001O0O101N100O10000O10O11N100O1O101M3N2M3N3L4L6J6I7I[a_;"
+      }
+    }
+  ]
+}
