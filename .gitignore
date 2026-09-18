@@ -36,6 +36,10 @@ __pycache__/
 .env
 .env~
 *.key
+stmtest1
+
+# ---- third-party clones (not vendored, not a submodule) ----
+external/
 
 # ---- os / editor ----
 .DS_Store

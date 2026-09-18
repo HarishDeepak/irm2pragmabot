@@ -20,8 +20,10 @@ before trusting any pose it produces.
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import Pose, TransformStamped
+from geometry_msgs.msg import Point, Pose, TransformStamped
 from scipy.spatial.transform import Rotation
+from std_msgs.msg import ColorRGBA
+from visualization_msgs.msg import Marker, MarkerArray
 
 
 def load_all_grasps(npz_path: str) -> np.ndarray:
@@ -61,7 +63,8 @@ def select_topdown_index(grasps_T_base: np.ndarray) -> int:
 
 def select_grasp_index(grasps_T_base: np.ndarray, confidences=None,
                        min_confidence: float = 0.0,
-                       max_tilt_deg: float = 0.0) -> int:
+                       max_tilt_deg: float = 0.0,
+                       table_normal: np.ndarray = np.array([0.0, 0.0, 1.0])) -> int:
     """Best-confidence grasp among the candidates that are near-perpendicular
     to the table. Returns -1 if none qualify - see below, this is a hard
     filter, not a fallback-able preference.
@@ -97,11 +100,21 @@ def select_grasp_index(grasps_T_base: np.ndarray, confidences=None,
     older best-effort behaviour (ignored rather than emptying the tilt
     survivors) since a merely low-confidence grasp is a judgement call,
     not a collision risk.
+
+    `table_normal` is the "up" direction tilt is measured against, in the
+    same frame as `grasps_T_base`. Defaults to base-frame +Z (the old
+    hardcoded assumption: fr3_link0 is gravity-aligned so straight up is
+    always [0,0,1]). Pass the Z axis of a per-object frame (see
+    object_frame_T_base) to gate against that object's own plane instead -
+    same math, just no longer assuming every surface is exactly level in
+    base frame.
     """
     approach_axis = grasps_T_base[:, :3, :3] @ np.array([0.0, 0.0, 1.0])
-    # Angle between the approach axis and straight down (base frame -Z).
+    normal = np.asarray(table_normal, dtype=np.float64)
+    normal = normal / np.linalg.norm(normal)
+    # Angle between the approach axis and straight down (-table_normal).
     # 0 deg = perpendicular to the table, 90 deg = horizontal.
-    tilt_deg = np.degrees(np.arccos(np.clip(-approach_axis[:, 2], -1.0, 1.0)))
+    tilt_deg = np.degrees(np.arccos(np.clip(-(approach_axis @ normal), -1.0, 1.0)))
 
     if max_tilt_deg > 0.0:
         tilt_keep = tilt_deg <= max_tilt_deg
@@ -309,6 +322,163 @@ def principal_axis_xy(points: np.ndarray):
     return np.array([long_2d[0], long_2d[1], 0.0]), elong
 
 
+def fit_plane_normal(points_base: np.ndarray,
+                     up_hint: np.ndarray = np.array([0.0, 0.0, 1.0])) -> np.ndarray:
+    """Best-fit surface normal of a point cloud, via full 3D PCA.
+
+    Returns a unit vector: the eigenvector of the cloud's 3D covariance
+    with the SMALLEST eigenvalue -- the direction the cloud is thinnest
+    along, i.e. its own "up" (or "down"; sign is picked to match
+    `up_hint`, see below). This is the real-plane-fit alternative to the
+    `table_normal=[0,0,1]` constant `object_frame_T_base` and
+    select_grasp_index/rank_grasp_indices' tilt gate have used until now
+    (ARMIN.md 2026-09-03, "no real plane fit yet -- this table is level,
+    so it hasn't been needed").
+
+    WHY THIS WORKS ON A SINGLE-VIEW SHELL, NOT JUST A FLAT OBJECT. The
+    segmented object cloud is a shell facing the camera (see
+    center_grasp_on_object's docstring), not a solid -- but for a roughly
+    convex object viewed from above, that shell's own points still vary
+    LEAST along the direction the camera was looking (their shared local
+    surface normal, averaged), and MOST along however the object is laid
+    out on the table. A cube lying flat, a banana lying on its side, a
+    bottle lying down: all have their least-variance direction pointing
+    up off the table, same as the table-normal assumption they replace --
+    the difference only shows up for an object that is itself resting at
+    an angle (propped against something, or a build with an intentionally
+    tilted top face), which is exactly the case the old hardcoded
+    `[0,0,1]` could not represent.
+
+    `up_hint` breaks the sign ambiguity every eigenvector has (v and -v
+    are both valid) and doubles as a sanity anchor: pass the OLD
+    table-normal assumption (default base-frame +Z) so the returned
+    normal is always the "up-ish" one, never accidentally flipped to
+    point down through the table.
+
+    Degenerate input (<3 points, or a cloud with no real thin direction --
+    e.g. a noisy/contaminated blob close to spherical) is not specially
+    detected here; callers that need a safety net should compare the
+    result against `up_hint` (e.g. reject/fall back if the angle between
+    them exceeds some bound) rather than trust every fit blindly - a bad
+    segmentation mask can make ANY geometric fit meaningless, same caveat
+    as principal_axis_xy.
+    """
+    p = np.asarray(points_base, dtype=np.float64)[:, :3]
+    hint = np.asarray(up_hint, dtype=np.float64)
+    hint = hint / np.linalg.norm(hint)
+    if len(p) < 3:
+        return hint
+
+    p = p - p.mean(axis=0)
+    cov = (p.T @ p) / len(p)
+    vals, vecs = np.linalg.eigh(cov)  # ascending eigenvalues
+    normal = vecs[:, 0]
+    if np.dot(normal, hint) < 0.0:
+        normal = -normal
+    return normal / np.linalg.norm(normal)
+
+
+def object_frame_T_base(points_base: np.ndarray, long_axis: np.ndarray = None,
+                        table_normal: np.ndarray = np.array([0.0, 0.0, 1.0])) -> np.ndarray:
+    """A rigid coordinate frame for a tabletop object, in base frame.
+
+    Origin: the object cloud's centroid. Z: `table_normal` -- the plane
+    the object sits on, default straight up in fr3_link0 (same
+    gravity-aligned assumption select_grasp_index's tilt gate already
+    makes: this robot's base frame is level, so "up" is always [0,0,1]
+    unless told otherwise). X: the object's own long axis in that plane
+    (principal_axis_xy, or pass one already computed to avoid running PCA
+    twice -- rank_grasp_indices' crossaxis preference already computes
+    this for elongated objects). Y completes a right-handed frame via
+    Y = Z x X.
+
+    This IS the frame to publish to TF for rviz (so the object's own
+    orientation, not just its position, is visible) and to feed back into
+    select_grasp_index/rank_grasp_indices as `table_normal` -- so "which
+    side is the correct approach side" is answered by this object's own
+    plane, not merely assumed to be base-frame +Z for every object.
+
+    A round/square footprint has no well-defined long axis (elongation
+    near 1.0); principal_axis_xy still returns SOME unit vector for it
+    (an eigenvector direction, arbitrary sign), which is fine here since
+    only Z (the approach-side gate) needs to be meaningful for those
+    objects -- X only matters for the crossaxis preference on elongated
+    ones.
+    """
+    points = np.asarray(points_base, dtype=np.float64)[:, :3]
+    centroid = points.mean(axis=0)
+
+    z = np.asarray(table_normal, dtype=np.float64)
+    z = z / np.linalg.norm(z)
+
+    if long_axis is None:
+        long_axis, _ = principal_axis_xy(points)
+    x = np.asarray(long_axis, dtype=np.float64)
+    x = x - z * np.dot(x, z)  # project out any component along Z
+    x_norm = np.linalg.norm(x)
+    if x_norm < 1e-9:
+        # long_axis was (near-)parallel to Z -- pick any perpendicular.
+        fallback = np.array([1.0, 0.0, 0.0])
+        if abs(np.dot(fallback, z)) > 0.9:
+            fallback = np.array([0.0, 1.0, 0.0])
+        x = fallback - z * np.dot(fallback, z)
+        x_norm = np.linalg.norm(x)
+    x = x / x_norm
+
+    y = np.cross(z, x)
+
+    T = np.eye(4)
+    T[:3, 0] = x
+    T[:3, 1] = y
+    T[:3, 2] = z
+    T[:3, 3] = centroid
+    return T
+
+
+def object_frame_markers(
+    T: np.ndarray, frame_id: str, stamp=None,
+    axis_len: float = 0.08, ns: str = "grasp_object_axes"
+) -> MarkerArray:
+    """Three ARROW markers (X red, Y green, Z blue -- rviz's own TF axis
+    convention) visualizing the frame `T` (as built by object_frame_T_base),
+    in `frame_id`. Shared by bridge_node's live broadcast and the
+    standalone visualize_object_frame_rviz.py test script, so both show
+    exactly the same thing built the same way.
+
+    `stamp` is a builtin_interfaces/Time (e.g. node.get_clock().now().to_msg());
+    pass None to leave it zero, which rviz still renders correctly as long
+    as `frame_id` is the Fixed Frame or resolvable via TF at time-zero
+    (any static/identity or timer-republished frame qualifies).
+    """
+    markers = MarkerArray()
+    colors = [
+        ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0),  # X - red
+        ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0),  # Y - green
+        ColorRGBA(r=0.0, g=0.0, b=1.0, a=1.0),  # Z - blue
+    ]
+    origin = T[:3, 3]
+    for axis_idx in range(3):
+        tip = origin + axis_len * T[:3, axis_idx]
+        m = Marker()
+        if stamp is not None:
+            m.header.stamp = stamp
+        m.header.frame_id = frame_id
+        m.ns = ns
+        m.id = axis_idx
+        m.type = Marker.ARROW
+        m.action = Marker.ADD
+        p0, p1 = Point(), Point()
+        p0.x, p0.y, p0.z = float(origin[0]), float(origin[1]), float(origin[2])
+        p1.x, p1.y, p1.z = float(tip[0]), float(tip[1]), float(tip[2])
+        m.points = [p0, p1]
+        m.scale.x = 0.006  # shaft diameter
+        m.scale.y = 0.012  # head diameter
+        m.scale.z = 0.0
+        m.color = colors[axis_idx]
+        markers.markers.append(m)
+    return markers
+
+
 def _crossaxis_factor(grasps_T_base: np.ndarray, long_axis: np.ndarray,
                       weight: float) -> np.ndarray:
     """Per-candidate multiplier in [1-weight, 1] rewarding grasps whose
@@ -332,11 +502,30 @@ def _crossaxis_factor(grasps_T_base: np.ndarray, long_axis: np.ndarray,
     return 1.0 - weight * along
 
 
+def crossaxis_angle_deg(grasps_T_base: np.ndarray, long_axis: np.ndarray) -> np.ndarray:
+    """Per-candidate deviation, in degrees, of the finger-closing axis from
+    perfectly perpendicular to `long_axis` -- 0 = ideal across-the-width
+    pinch, 90 = worst-case end-to-end pinch along the length. Public (not
+    a leading underscore) so callers can log the achieved angle for the
+    grasp actually chosen, not just gate on it.
+    """
+    fx = grasps_T_base[:, :3, 0]
+    fx_xy = fx[:, :2]
+    n = np.linalg.norm(fx_xy, axis=1)
+    n[n < 1e-9] = 1e-9
+    fx_xy = fx_xy / n[:, None]
+    la = long_axis[:2] / max(np.linalg.norm(long_axis[:2]), 1e-9)
+    along = np.clip(np.abs(fx_xy @ la), 0.0, 1.0)
+    return np.degrees(np.arcsin(along))
+
+
 def rank_grasp_indices(grasps_T_base: np.ndarray, confidences=None,
                        min_confidence: float = 0.0,
                        max_tilt_deg: float = 0.0,
                        object_long_axis=None,
-                       crossaxis_weight: float = 0.0) -> np.ndarray:
+                       crossaxis_weight: float = 0.0,
+                       max_crossaxis_angle_deg: float = 0.0,
+                       table_normal: np.ndarray = np.array([0.0, 0.0, 1.0])) -> np.ndarray:
     """Every candidate that passes the tilt gate, best-first.
 
     Same gate and same ordering as select_grasp_index() -- which is now a
@@ -349,6 +538,23 @@ def rank_grasp_indices(grasps_T_base: np.ndarray, confidences=None,
     the fix for elongated objects (banana, carrot), where the highest
     confidence grasp is often a physically useless end-to-end pinch. Pass
     None / 0.0 to leave ordering by confidence alone (the cube path).
+
+    `max_crossaxis_angle_deg` (+ `object_long_axis`) is a HARD gate on top
+    of that soft re-rank, same fail-closed contract as the tilt gate.
+    VISUALLY CONFIRMED 2026-09-03 on a real banana: the commanded grasp's
+    fingers closed at roughly a 45 deg diagonal to the banana's length,
+    not perpendicular to it - neither a clean crosswise pinch nor a
+    lengthwise one, on an object with no flat spot to catch an off-axis
+    contact on. The soft re-rank alone does not prevent this: GraspGen's
+    diffusion sampling is stochastic, so a high-enough-confidence diagonal
+    candidate can still outscore the crossaxis penalty and win on a given
+    call, which also explains why the failure was reported as
+    intermittent rather than constant. This gate removes any candidate
+    whose finger-closing axis is more than `max_crossaxis_angle_deg` away
+    from perfectly across the object's long axis, before confidence
+    ranking -- "close to perpendicular AND confident", not "confident
+    enough to make up for a bad angle". 0 disables it (the
+    crossaxis_weight soft preference above is unaffected either way).
 
     WHY THIS EXISTS (measured 2026-08-26). The tilt gate checks the
     approach ANGLE but says nothing about whether the fingers actually
@@ -363,14 +569,31 @@ def rank_grasp_indices(grasps_T_base: np.ndarray, confidences=None,
 
     Returns an empty array if nothing survives the tilt gate (callers must
     check, exactly as they must check select_grasp_index()'s -1).
+
+    `table_normal` (see select_grasp_index) is the "up" direction tilt is
+    measured against; defaults to base-frame +Z. Pass a per-object frame's
+    Z axis (object_frame_T_base) to gate against that object's own plane.
     """
     approach_axis = grasps_T_base[:, :3, :3] @ np.array([0.0, 0.0, 1.0])
-    tilt_deg = np.degrees(np.arccos(np.clip(-approach_axis[:, 2], -1.0, 1.0)))
+    normal = np.asarray(table_normal, dtype=np.float64)
+    normal = normal / np.linalg.norm(normal)
+    tilt_deg = np.degrees(np.arccos(np.clip(-(approach_axis @ normal), -1.0, 1.0)))
 
     keep = tilt_deg <= max_tilt_deg if max_tilt_deg > 0.0 else np.ones(len(grasps_T_base), bool)
     candidates = np.where(keep)[0]
     if len(candidates) == 0:
         return candidates
+
+    # HARD cross-axis angle gate (see docstring) -- fails closed exactly
+    # like the tilt gate, and only ever engages when the caller identified
+    # an elongated object in the first place.
+    if object_long_axis is not None and max_crossaxis_angle_deg > 0.0:
+        angle_deg = crossaxis_angle_deg(
+            grasps_T_base[candidates], np.asarray(object_long_axis, float))
+        angle_keep = angle_deg <= max_crossaxis_angle_deg
+        if not angle_keep.any():
+            return np.array([], dtype=candidates.dtype)
+        candidates = candidates[angle_keep]
 
     if confidences is None:
         return candidates[np.argsort(tilt_deg[candidates])]
@@ -391,6 +614,102 @@ def rank_grasp_indices(grasps_T_base: np.ndarray, confidences=None,
             grasps_T_base[candidates], np.asarray(object_long_axis, float),
             float(np.clip(crossaxis_weight, 0.0, 1.0)))
     return candidates[np.argsort(-rank_score)]
+
+
+def rotate_about_local_z(grasps: np.ndarray, deg: float) -> np.ndarray:
+    """Rotate every grasp about its OWN approach axis (GraspGen convention:
+    local +Z) by `deg` degrees - i.e. right-multiply each pose by Rz(deg),
+    a purely local/intrinsic rotation. Frame-independent: applying it here
+    in camera frame vs. later in base frame gives the identical result,
+    since (T_base_from_cam @ G) @ Rz == T_base_from_cam @ (G @ Rz).
+
+    WHY THIS EXISTS (2026-09-16). This robot's own URDF rotates the
+    `fr3_hand` frame by exactly -45 deg (-pi/4) about Z relative to the
+    arm's flange (fr3.urdf.xacro, `rpy_ee` default `0 0 ${-pi/4}`) - a
+    real, confirmed, hardware-defined offset. MoveIt already accounts for
+    it correctly whenever it solves IK for `fr3_hand` - that is just part
+    of the robot's own kinematic chain. GraspGen's poses, however, are
+    computed against a DIFFERENT Franka gripper asset (the ACRONYM
+    dataset's `franka_panda_gripper_spherical_dof_acronym.urdf`, not this
+    project's own franka_hand.xacro), whose own base-link convention was
+    not confirmed to include this same -45 deg. If it does not, every
+    commanded grasp is systematically off by that fixed rotation about the
+    approach axis - which leaves TILT (measured from local Z) completely
+    unaffected while the finger-closing axis (X, in the XY-plane) ends up
+    wrong regardless of how well candidates are otherwise selected -
+    matching two independent real observations of "the grasp closed at a
+    45 deg diagonal" months apart (ARMIN.md 2026-09-03, and a banana pick
+    this session), neither explained by grasp-selection tuning.
+
+    NOT applied by default (see execute_pick's
+    `graspgen_frame_yaw_offset_deg`, default 0.0) - this is a hypothesis
+    backed by one confirmed fact (the URDF offset) and two matching visual
+    reports, not a verified fix. Test with +45/-45 and see which one
+    (if either) makes the real finger-closing axis land correctly; this
+    function is intentionally a free parameter rather than a hardcoded
+    sign so that test costs one flag change, not a new guess each time.
+    """
+    if deg == 0.0 or grasps.shape[0] == 0:
+        return grasps
+    rad = np.radians(deg)
+    c, s = np.cos(rad), np.sin(rad)
+    rz = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    out = grasps.copy()
+    out[:, :3, :3] = grasps[:, :3, :3] @ rz
+    return out
+
+
+def normalize_grasp_wrist_rotation(
+    grasps_T_base: np.ndarray,
+    neutral_x: np.ndarray = np.array([1.0, 0.0, 0.0]),
+) -> tuple:
+    """Remove the wrist-twist ambiguity between a grasp and its 180 deg
+    "backhand" twin, before ranking.
+
+    WHY THIS EXISTS (ARMIN.md 2026-08-28, "Grasp selector accepts backhand
+    (high-yaw) grasps"): GraspGen's franka_panda convention has the fingers
+    close symmetrically along local +/-X (approach axis is local +Z, see
+    module docstring) -- a grasp and the candidate obtained by rotating it
+    180 deg about its OWN approach axis close on exactly the same points on
+    the object, so they are physically interchangeable. But they demand
+    opposite wrist orientations to reach, and nothing upstream picks
+    between them -- confidence/tilt/cross-axis are all invariant to this
+    flip, since they only look at the approach axis or the cross-axis
+    angle (which is computed on an axis, not a signed direction). Left
+    alone, the selector can accept whichever one GraspGen happened to
+    return, which is sometimes the one requiring 180 deg+ of wrist rotation
+    to reach -- the wristy/near-singular motion noted in that entry.
+
+    THE FIX. For each candidate, compare its local X (finger-closing axis,
+    already in base frame here) against a single fixed reference direction
+    `neutral_x` (default base-frame +X -- "forward" out of the robot,
+    matching the free choice a human would make: turn the wrist the SHORT
+    way). If the finger axis points away from that reference (dot < 0),
+    rotate the candidate 180 deg about its own approach axis (local Z) --
+    exact and cheap in matrix form: that rotation is Rz(pi) = diag(-1,-1,1)
+    applied on the RIGHT (local frame), so it negates local X and Y and
+    leaves local Z (and therefore the tilt gate, which only reads local Z)
+    completely unchanged. The grasp position, approach direction and
+    fingertip contact points are identical before and after -- only which
+    physical rotation reaches that same grasp changes, so this is safe to
+    apply unconditionally before any gate/rank downstream.
+
+    Returns (normalized_grasps, num_flipped) -- the count is for logging,
+    not a gate: `grasps_T_base` is never filtered, only reoriented.
+    """
+    if grasps_T_base.shape[0] == 0:
+        return grasps_T_base, 0
+
+    neutral = np.asarray(neutral_x, dtype=np.float64)
+    neutral = neutral / np.linalg.norm(neutral)
+
+    finger_axis = grasps_T_base[:, :3, 0]  # local X, base frame
+    flip = (finger_axis @ neutral) < 0.0
+
+    normalized = grasps_T_base.copy()
+    normalized[flip, :3, 0] = -normalized[flip, :3, 0]
+    normalized[flip, :3, 1] = -normalized[flip, :3, 1]
+    return normalized, int(np.count_nonzero(flip))
 
 
 def matrix_to_pose(T: np.ndarray) -> Pose:

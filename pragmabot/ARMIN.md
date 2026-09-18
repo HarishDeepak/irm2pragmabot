@@ -1151,3 +1151,339 @@ above, hand-grade against the expected first action, and compute
 accuracy per condition — same shape as the paper's Fig. 7 left two
 radar charts, without the token/latency columns until those are wired
 up.
+
+---
+
+# 2026-09-03 — per-object coordinate frame: transform, filter, and rviz visualization
+
+## What was asked for
+
+A per-object coordinate frame, derived from the segmented object cloud,
+that (1) can be seen in rviz — "coordination" of the object, not just its
+position — and (2) is used to filter/limit which grasp candidates are
+allowed, instead of relying only on an implicit "down is always base +Z"
+assumption. Also asked to be able to remove candidates that grasp along
+the object's **length** rather than across it.
+
+## What was built (`pragmabot_bridge/pragmabot_bridge/`)
+
+**`grasp_transform.py`** — three new/changed pieces:
+- `object_frame_T_base(points_base, long_axis=None, table_normal=[0,0,1])`
+  — builds a right-handed rigid frame per object: origin = cloud centroid,
+  Z = `table_normal` (the plane the object sits on), X = the object's own
+  long axis (reuses `principal_axis_xy`), Y = Z × X.
+- `object_frame_markers(T, frame_id, stamp=None, axis_len=0.08, ...)` — a
+  `visualization_msgs/MarkerArray` of three ARROW markers (X red, Y green,
+  Z blue) visualizing that frame, shared by both the live bridge and the
+  standalone test script below so they render identically.
+- `select_grasp_index` / `rank_grasp_indices` generalized to take a
+  `table_normal` parameter (default `[0,0,1]`, so existing behaviour is
+  byte-identical unless a caller passes something else) instead of a
+  hardcoded base-frame +Z, so the tilt/approach-side gate can be expressed
+  against an object's own frame rather than a fixed global assumption.
+
+**`bridge_node.py`** (`execute_pick`) — computes `object_frame_T_base`
+from the real object cloud whenever `object_pcd_file` is set (not just
+for elongated objects), broadcasts it both to TF (child frame
+`grasp_object` under `fr3_link0`) and to a new topic
+`grasp_object_markers` (`MarkerArray`) via a new `_broadcast_object_frame`
+helper, and feeds its Z axis into `rank_grasp_indices(..., table_normal=)`
+— so the frame you can see in rviz is literally the one filtering the
+candidates, not a separate visualization guess. `table_normal` is
+currently still fixed at `[0,0,1]` (this table is level; no real plane
+fit yet) — the plumbing accepts a real plane fit later with no
+caller-side change.
+
+**Cross-axis ("don't grasp the length") gate — already existed, now
+confirmed wired to this same frame.** `rank_grasp_indices`'s
+`max_crossaxis_angle_deg` (default 20°) is a **hard** reject on any
+candidate whose finger-closing axis is more than that many degrees off
+perfectly-crosswise to the object's long axis — the same `_axis` that is
+now also the X axis of the broadcast `object_frame_T_base`. Only engages
+when footprint elongation ≥ `crossaxis_min_elongation` (1.6), so
+cubes/round objects (no meaningful "length") are unaffected. Nothing new
+had to be added for the "remove lengthwise grasps" ask — it was already
+implemented from the 2026-08-28 cross-axis session, it's just now visibly
+tied to the rviz-visible frame instead of a hidden PCA call.
+
+## Standalone rviz test tool (new)
+
+`calibration/visualize_object_frame_rviz.py` — publishes the exact same
+`object_frame_markers` MarkerArray plus a `PointCloud2` of the object
+cloud, from a bare rclpy node on a timer, with **no bridge_node, gripper
+homing, or pick attempt required**. Two modes:
+- default: publishes the loaded cloud as-is (camera frame) under
+  `--frame_id` (default `world`) — pure rendering/math check, not
+  positioned realistically.
+- `--transform_to_base`: looks up the live TF chain (`fr3_link0 <-
+  --camera_frame`, the same lookup `execute_pick` does) and transforms
+  the cloud + frame into `--base_frame` (default `fr3_link0`) before
+  publishing — positions it where the real robot would see it. Verified
+  against the real captured cloud (`/tmp/pragmabot_live_cloud.npy`,
+  2000 pts, elongation 3.30:1): object frame origin landed at
+  `[0.62, -0.013, 0.027]` in `fr3_link0`, i.e. on the table in front of
+  the robot, as expected.
+
+Defaults to `/tmp/pragmabot_live_cloud.npy` (the real cloud from the last
+pick attempt) if present, else a synthetic banana-shaped cloud.
+
+## rviz setup that actually worked, and the snags hit getting there
+
+1. `Add → By topic → /grasp_object_markers → MarkerArray` and same for
+   `/object_cloud`.
+2. First snag: **MarkerArray showed "Status: Error"**. Expanding it gave
+   `Frame [world] does not exist` — a fresh rviz2 session's Fixed Frame
+   defaults to `map`, and nothing published a `world` TF link, so a
+   marker with `header.frame_id: "world"` couldn't be placed. This is
+   why "no error" is not the same as "correctly configured" — always
+   expand the Status row, don't just glance at the color.
+2b. This surfaced that the **real robot/TF stack was already running**
+   on this machine (`fr3_link0`, `zed_...`, `base` frames all present in
+   the Fixed Frame dropdown) — so `--transform_to_base` could be tested
+   for real immediately rather than needing a separate robot session.
+3. Fix: set Fixed Frame to a frame that actually exists — switched to
+   `--transform_to_base` (frame `fr3_link0`) instead of fighting rviz
+   over an invented `world` frame.
+4. Second snag: no error, but still **no visible arrows**. Cause:
+   arrows are only 8 cm (`--axis_len`) at a robot-scale rviz camera
+   view, at `x≈0.62 m` in front of the base — easy to miss unless you
+   zoom/pan to that location. Also worth checking the MarkerArray
+   display's **Namespaces** list (`grasp_object_axes`) is ticked; rviz
+   sometimes leaves a namespace unticked right after a display recovers
+   from an earlier error state. Confirmed visible after zooming in.
+
+## Open / not yet done
+
+- `table_normal` is still hardcoded to `[0,0,1]` everywhere — no real
+  plane fit against a tilted surface yet (this table is level, so it
+  hasn't been needed).
+- The cross-axis gate filters by **angle only** (crosswise vs lengthwise
+  pinch), not by **which end** of an elongated object is contacted, and
+  not by excluded regions (e.g. a handle, a rim) — raised as a possible
+  next step but not requested/implemented this session.
+- Not yet re-run through a live `execute_pick()` end to end with this
+  code (only the standalone script + a real captured cloud were
+  exercised); next real pick attempt is the first live test of the
+  wiring in `execute_pick`.
+- User flagged something as "a bit wrong" in the assistant's account of
+  this work but had not yet specified what at the time this note was
+  written — follow up and correct here once identified.
+
+---
+
+# 2026-09-16 — banana grasp debugging marathon: object-frame filtering,
+# a real gripper-frame-convention bug, and first end-to-end success
+
+## Goal for the session
+
+Pick up a real banana. Wanted (a) to extend the per-object coordinate
+frame from 2026-09-03 into an actual grasp filter that generalizes past
+cubes, and (b) to fix whatever was making every real banana attempt fail.
+This took many iterations on real hardware; this entry is the full
+account, including the wrong turns, because two of them (backhand-flip
+normalization, the frame-yaw correction's first placement) are easy to
+re-introduce by accident if re-derived from scratch.
+
+## What shipped and stayed on
+
+**Step-2 retry-across-candidates** (`bridge_node.py execute_pick`). The
+existing retry loop only covered Step 1 (reaching the standoff) - if
+Step 2 (the hover+descend Cartesian plan) failed for the winning
+candidate, the whole pick aborted with a message that literally said
+"pick a different grasp candidate" without ever trying one. Merged
+Steps 1+2 into one loop: a Step-2 *planning* failure (fraction < 1.0, no
+motion attempted) now falls through to the next candidate exactly like a
+Step-1 failure already did; a failure *during* actual motion still
+aborts (arm position then unknown) - same safety rule as before.
+
+**`elongated_max_grasp_tilt_deg`** (default 20, was tried at 15). Three
+early banana attempts all failed in the 24-26 deg tilt range regardless
+of which candidate - not a selection-quality problem, a reachability one.
+Tightening the tilt gate specifically for elongated objects (engaged by
+the same `crossaxis_min_elongation` condition as the existing cross-axis
+preference; cubes untouched) fixed that. 15 deg turned out to combine
+badly with the width gate (some draws left zero survivors after both
+fired), loosened to 20 - still well clear of the 24-26 deg failure band.
+
+**`max_grasp_length_offset_frac`** (default 0.75) - a NEW gate, and the
+direct answer to "filter in the object's own coordinates, not the
+world's." A real banana photo showed a well-angled (per the cross-axis
+gate) grasp landing on the object's *tip*, not its middle - the angle
+gate alone cannot catch this, since a curved object's local direction
+near an end can diverge from the single global PCA axis fitted over the
+whole cloud. Projects each candidate's *position* onto the object
+frame's own long axis (`object_frame_T_base`'s X, the same one the
+cross-axis angle gate uses) and rejects anything too close to an end,
+expressed as a fraction of that object's own half-length - genuinely
+object-frame-relative, not a world-frame distance.
+
+**`local_grasp_depth_anchor`** (default True) + `local_top_radius_m`
+(0.025). The existing table-anchored grasp depth computed ONE global
+98th-percentile top over the whole object cloud and applied that same
+absolute z-plane to every candidate everywhere along the object - fine
+for a cube, wrong for a visibly curved banana whose true local height at
+the actual grasp (x,y) can differ a lot from the object's overall max.
+Each candidate's target is now computed from only the cloud points
+within `local_top_radius_m` of *its own* position, falling back to the
+old global anchor if too few local points are found.
+
+**Grasp-candidate rviz markers** (`_broadcast_grasp_markers`, new topic
+`grasp_candidates_markers`). Draws the ranked/viable candidate pool as
+thin orange arrows and the pose about to be commanded as a real gripper
+icon (two fingers + knuckle bar, sized to the actual `gripper_width`),
+built directly from the same pose sent to MoveIt. Two real bugs found
+and fixed while building this: (1) it was broadcasting BEFORE the
+Step-1/2 retry loop, so if the loop later switched candidates the marker
+kept showing the abandoned one - reported as "45 deg different between
+what's shown and what the robot does," which was a stale-marker bug, not
+a grasp-selection bug; moved the broadcast to fire fresh on every
+attempt that reaches its standoff. (2) both this marker set and the
+2026-09-03 object-frame markers used the same red/green/blue scheme,
+making them visually indistinguishable when both topics were added at
+once - grasp markers recolored to orange/magenta. Also added: a
+diagnostic-only broadcast on the width-gate failure path (the function
+returns False right after, so zero motion risk), since a run where
+nothing passes width previously published no marker at all, making it
+impossible to visually check anything without a lucky draw.
+
+**MoveIt error-code logging** (`_moveit_error_name`, built once from
+`MoveItErrorCodes`'s own constants). `_execute_trajectory` used to
+return False on a non-SUCCESS `ExecuteTrajectory` result with no log
+line of its own (unlike `_move_to_pose`, which already logged its code) -
+a real banana execution fault showed up as nothing more than "Cartesian
+approach execution failed." Now both log the actual code and name (e.g.
+`error_code=-6 (TIMED_OUT)`).
+
+**Object-frame terminal log + marker QoS fix.** Every pick now logs the
+full object frame matrix directly (`object frame (fr3_link0 <-
+grasp_object), origin=...`), independent of rviz. The object-frame
+marker publisher was also switched to `TRANSIENT_LOCAL` QoS - a plain
+volatile publisher (the previous default) delivers nothing to an rviz
+Display added after the one `publish()` call a pick makes, and a pick
+runs in a few seconds; this was silently making the frame invisible to
+anyone who added the Display slightly late, not an rviz configuration
+mistake as first suspected.
+
+**Post-grasp verification** (`_current_gripper_width`, subscribes
+`/franka_gripper/joint_states`). `franka_msgs/Grasp`'s own success flag
+uses a deliberately generous outer epsilon (see `_grasp()`'s existing
+docstring), so a barely-touching, insecure close can report success
+exactly like a real grasp - measured directly: a real banana pick
+reported `success=True`, `Pick sequence complete`, and the banana was
+still on the table. Now polls for a fresh real finger-separation reading
+after every reported-successful `_grasp()` call and aborts BEFORE the
+lift, with an honest message, if the fingers closed narrower than
+`min_gripper_width` (nothing actually held) - same "a reported SUCCESS is
+not evidence" philosophy the pre-existing ARRIVAL CHECK already applies
+to arm position, now applied to the gripper too. Always logs the
+measured width (not just on failure) for visibility either way.
+
+**`gripper_force` 20 -> 40 N.** A pick that passed the new width-verify
+check (real material confirmed between the fingers, not empty air) still
+released the banana once the lift actually started - points at
+insufficient grip force/friction for a round, slippery object under
+motion, not a detection or selection problem. Franka Hand's rated max is
+~70 N; 40 N is a safe middle step. If it still slips specifically during
+the lift (not while sitting on the table) after this, push further
+toward 60-70 N.
+
+## The big one: a real gripper-frame-convention bug (likely months old)
+
+Every banana attempt this session, even with excellent logged
+tilt/cross-axis numbers, physically grasped along the banana's length or
+missed - independent of how well selection was tuned. Traced to a
+confirmed fact: this robot's own URDF (`fr3.urdf.xacro`, `rpy_ee`
+default `0 0 ${-pi/4}`) rotates the real `fr3_hand` frame by **exactly
+-45 deg about Z** relative to the arm's flange. GraspGen's poses are
+computed against a DIFFERENT Franka gripper asset
+(`franka_panda_gripper_spherical_dof_acronym.urdf`, from the ACRONYM
+dataset, not this project's own `franka_hand.xacro`) whose own
+base-link convention was never confirmed to include that same offset.
+If it doesn't, every commanded grasp orientation has been systematically
+off by a fixed rotation about the approach axis this whole time - which
+would leave TILT (measured from the approach axis, local Z) completely
+unaffected while the finger-closing axis (local X) is wrong regardless
+of candidate quality. This matches an independent, unexplained
+observation from 2026-09-03 ("the commanded grasp's fingers closed at
+roughly a 45 deg diagonal to the banana's length") that grasp-selection
+tuning never actually fixed back then either - two real observations,
+months apart, landing on the same number.
+
+Fix: new parameter `graspgen_frame_yaw_offset_deg`, defaulted to **-45.0**
+(derived from the URDF fact plus the asset-convention hypothesis, not a
+verified certainty - see the parameter's own comment in `bridge_node.py`
+for the full derivation). `grasp_transform.rotate_about_local_z(grasps,
+deg)` right-multiplies a grasp by `Rz(deg)` about its own approach axis -
+exact, and leaves tilt completely unchanged (verified: only local X/Y
+rotate, local Z does not).
+
+**Placement bug, found and fixed the same session.** First applied this
+correction at load time, before `center_grasp_on_object` and
+`estimate_gripper_width` ran. Both of those project the object cloud
+onto "local X" assuming it is the true finger-closing axis - a
+pre-rotated local X sent the centering shift down a meaningless
+diagonal (a real banana's grasp marker ended up hovering off the
+object's tip in rviz) and corrupted width measurement (candidate counts
+collapsed, nearly everything read as the wrong width). Not evidence
+against the 45 deg hypothesis - proof it has to be applied at the very
+last step. Fixed: now applied ONLY to the single already-selected
+commanded pose, after every gate/centering/width computation has run on
+GraspGen's native (uncorrected) output - selection is byte-identical to
+before this parameter existed; only the final orientation sent to
+MoveIt (and the rviz marker) differs.
+
+**Also discovered along the way and disabled by default** (kept in code,
+one flag away, NOT verified to help):
+- `normalize_grasp_wrist_rotation` (flips a candidate 180 deg about its
+  own approach axis toward a fixed `wrist_neutral_x` reference, meant to
+  avoid a wound-up "backhand" wrist). Real banana test: flipped ~half of
+  1200 candidates, and the finger-axis alignment with the fixed
+  reference was only ~0.02-0.13 (near-zero, effectively arbitrary for
+  this object's orientation) - plausibly biased every candidate toward
+  the LESS reachable of the two symmetric orientations rather than the
+  more reachable one. Needs a reference tied to the arm's actual reach
+  direction, not a fixed world axis, before it is worth re-enabling.
+- `fit_object_plane_normal` (real per-object plane fit for the tilt
+  gate's `table_normal`, replacing the hardcoded base +Z). Verified
+  correct offline (a synthetic 30 deg-tilted cloud fit to 30.07 deg).
+  On a flat-lying banana it only ever measured ~5-6 deg off vertical -
+  essentially a no-op for this object, so it never got a real test
+  either way. Worth revisiting with a genuinely tilted/propped object.
+
+## Result
+
+First confirmed real banana pick this project has produced: tilt 17.7
+deg, cross-axis 4.7 deg, `ARRIVAL CHECK` error 0.4 mm, Cartesian
+execution succeeded with no singularity/timeout fault, grasp verified to
+hold real material via the new width check. Still releasing the object
+during the lift itself as of the last run before this note was written -
+`gripper_force` was just raised 20 -> 40 N in response; not yet
+re-confirmed on hardware.
+
+## Open for next session
+
+**START HERE.** Session ended before the `gripper_force` 20->40 N change
+and the post-grasp width-verify check were ever tested on hardware -
+`bridge_node` had NOT been restarted since those edits landed. First
+action tomorrow: restart `bridge_node` (bare `ros2 run pragmabot_bridge
+bridge_node`, no flags needed - both are code-default changes) and retry
+the same banana pick. Watch for the new
+`Measured finger separation after grasp: X mm` log line either way, and
+whether it still releases specifically during/after the lift step.
+
+- Confirm the `gripper_force` bump actually stops the mid-lift release;
+  push toward 60-70 N if it does not.
+- The -45 deg yaw offset is a strong, partially-verified hypothesis
+  (one confirmed URDF fact + one unconfirmed assumption about GraspGen's
+  ACRONYM asset), not a certainty - keep watching the ARRIVAL CHECK and
+  cross-axis numbers on future elongated-object picks for regressions,
+  and revisit if a NON-elongated object (where a 45 deg orientation
+  error is less visually obvious) starts behaving oddly.
+- `normalize_grasp_wrist_rotation` needs a real-reach-direction reference
+  before it is worth another real-hardware test.
+- `fit_object_plane_normal` still has no genuinely tilted-object test.
+- Re-verify cube/pepper picks still work now that `gripper_force` (40 N,
+  up from 20) and `elongated_max_grasp_tilt_deg`/
+  `max_grasp_length_offset_frac` (elongated-object-only, should be
+  no-ops for a cube) have changed - nothing in this session touched
+  cube-path defaults directly, but worth one confirmation run.

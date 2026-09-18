@@ -9,7 +9,7 @@ gradio_share: false
 max_steps: 10
 
 # --- Memory Settings ---
-activate_stm: true
+activate_stm: true 
 activate_ltm: false
 save_to_ltm: false
 use_random_retrieval: false

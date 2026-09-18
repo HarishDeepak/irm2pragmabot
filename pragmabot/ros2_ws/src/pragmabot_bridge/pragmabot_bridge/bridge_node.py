@@ -95,7 +95,9 @@ import numpy as np
 import rclpy
 from franka_msgs.action import Grasp, Homing, Move
 from franka_msgs.msg import GraspEpsilon
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Point, Pose, TransformStamped
+from sensor_msgs.msg import JointState
+
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import (
     BoundingVolume,
@@ -106,19 +108,38 @@ from moveit_msgs.msg import (
     PlanningScene,
     PositionConstraint,
 )
-from moveit_msgs.srv import ApplyPlanningScene, GetCartesianPath
+from moveit_msgs.srv import ApplyPlanningScene, GetCartesianPath, GetPositionIK
 from pragmabot_interfaces.action import ExecuteSkill
 from rclpy.action import ActionClient, ActionServer
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile
 from shape_msgs.msg import SolidPrimitive
-from std_msgs.msg import Header
-from tf2_ros import Buffer, TransformListener
+from std_msgs.msg import ColorRGBA, Header
+from tf2_ros import Buffer, TransformBroadcaster, TransformListener
+from visualization_msgs.msg import Marker, MarkerArray
 
 from pragmabot_bridge import grasp_transform
 from pragmabot_bridge.cartesian_path import cartesian_step_schedule
 from pragmabot_bridge.fr3_limits import FR3Limits
+
+# int error code -> constant name, e.g. -4 -> "CONTROL_FAILED", -12 ->
+# "TIMED_OUT". Built once from MoveItErrorCodes' own constants so every
+# call site that reports a failed ExecuteTrajectory/MoveGroup result can
+# say WHICH failure it was (a real robot-side collision/reflex vs a
+# planning-side abort) instead of just "it wasn't SUCCESS" - the gap that
+# made a real on-hardware execution fault (2026-09-16, banana pick) show
+# up in the log as nothing more than "Cartesian approach execution failed".
+_MOVEIT_ERROR_NAMES = {
+    getattr(MoveItErrorCodes, name): name
+    for name in dir(MoveItErrorCodes)
+    if name.isupper() and isinstance(getattr(MoveItErrorCodes, name), int)
+}
+
+
+def _moveit_error_name(code: int) -> str:
+    return _MOVEIT_ERROR_NAMES.get(code, "UNKNOWN")
 
 
 class PragmabotBridge(Node):
@@ -138,8 +159,86 @@ class PragmabotBridge(Node):
 
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
+        # Publishes the object's own coordinate frame (see
+        # grasp_transform.object_frame_T_base) so it is visible in rviz
+        # and so grasp filtering can be expressed against that object's
+        # actual plane instead of assuming every surface is base-frame
+        # level. Set by execute_pick() each pick attempt.
+        self._object_tf_broadcaster = TransformBroadcaster(self)
+        # RViz can show a TF frame directly (Add -> TF, tick "Show Axes"),
+        # but that requires knowing the frame name in advance and gives
+        # you thin fixed-size axes with no label. A MarkerArray is the
+        # standard way to make a coordinate frame something you can just
+        # find in the topic list and see at object scale -- see
+        # _broadcast_object_frame().
+        # TRANSIENT_LOCAL so rviz sees it even when its Display was only
+        # added/subscribed AFTER the pick attempt already published this -
+        # a real gap, not just an rviz setup snag: a plain volatile
+        # publisher (the previous default int-depth QoS) delivers nothing
+        # to a subscriber that joins after the one publish() call a pick
+        # makes, and a pick runs in a few seconds - easy to miss entirely.
+        # depth=1: only the latest object's frame is meaningful to latch.
+        self._object_marker_pub = self.create_publisher(
+            MarkerArray, "grasp_object_markers",
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        # The actual GraspGen candidates being considered THIS pick - the
+        # ranked/viable pool as thin orange arrows (approach axis only),
+        # plus the one about to be commanded drawn as a real gripper icon
+        # (two fingers + knuckle bar, sized to the actual gripper_width),
+        # in fr3_link0 - so what you see in rviz, next to the real robot
+        # and the live ZED point cloud, is the exact pose being sent to
+        # MoveIt, not a separate offline reconstruction. See
+        # _broadcast_grasp_markers(). Same TRANSIENT_LOCAL reasoning as
+        # the object-frame publisher above.
+        self._grasp_candidates_pub = self.create_publisher(
+            MarkerArray, "grasp_candidates_markers",
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self._scene_client = self.create_client(ApplyPlanningScene, "/apply_planning_scene")
         self._table_in_scene = False
+
+        # IK client used ONLY to ESTIMATE how far a grasp candidate's
+        # standoff pose is from the arm's CURRENT joint configuration - see
+        # grasp_transform.config_distance() and the retry loop in
+        # execute_pick(). Never used to command motion, only to rank
+        # candidates before the real retry loop tries them.
+        self._ik_client = self.create_client(GetPositionIK, "/compute_ik")
+
+        # Real arm joint positions (fr3_joint1..7), separate from the
+        # gripper's own joint_states subscription above. Needed so the
+        # retry loop can prefer whichever grasp candidate needs the LEAST
+        # arm motion from here, instead of walking candidates purely by
+        # confidence - real picks showed candidates on opposite sides of
+        # an object (orientations ~180 deg apart) can get tried back to
+        # back, swinging the waist/arm a lot between two real robot
+        # motions with nothing selecting for it (2026-09-17, real carrot/
+        # banana picks).
+        # Topic published by the arm's own joint_state_broadcaster - NOT
+        # verified live for this project (see the module's other frame/
+        # topic caveats); confirm with `ros2 topic echo /joint_states`
+        # that it carries fr3_joint1..7 before trusting the reordering
+        # below on real hardware.
+        self.declare_parameter("arm_joint_states_topic", "/joint_states")
+        self._arm_joint_state = None
+        self.create_subscription(
+            JointState, self.get_parameter("arm_joint_states_topic").value,
+            lambda msg: setattr(self, "_arm_joint_state", msg), 10)
+
+        # VERIFY A GRASP ACTUALLY HOLDS SOMETHING, not just that the Grasp
+        # action reported success. See _current_gripper_width() / the
+        # check in execute_pick's Step 3 - franka_msgs/Grasp's own success
+        # flag uses a deliberately generous outer epsilon (see _grasp()'s
+        # docstring) precisely so an underestimated object still reports
+        # success; the same generosity means a barely-touching, insecure
+        # close can ALSO report success. Real banana pick 2026-09-16:
+        # Grasp reported success, `Pick sequence complete` logged, but the
+        # object was back on the table - i.e. exactly this false positive,
+        # same class as the ARRIVAL CHECK this file already does for
+        # position (MoveIt reporting SUCCESS is not evidence of arrival;
+        # Grasp reporting SUCCESS is not evidence of a secure hold).
+        self._gripper_joint_state = None
+        self.create_subscription(
+            JointState, "/franka_gripper/joint_states",
+            lambda msg: setattr(self, "_gripper_joint_state", msg), 10)
 
         # Reentrant group + MultiThreadedExecutor (see module docstring):
         # the skill callbacks block on spin_until_future_complete, which
@@ -196,6 +295,56 @@ class PragmabotBridge(Node):
         # per pick; the parameter is kept so offline replay against a saved
         # npz still works.
         self.declare_parameter("grasp_file", "")
+        # See grasp_transform.rotate_about_local_z's docstring: a
+        # suspected fixed offset between GraspGen's own Franka-gripper
+        # asset convention and this robot's REAL fr3_hand frame, which is
+        # rotated -45 deg / -pi/4 about Z from the arm's flange (confirmed
+        # in fr3.urdf.xacro's `rpy_ee` default - a real hardware fact, not
+        # a guess). DEFAULTED TO -45.0, not 0.0 (2026-09-16) - reasoning:
+        # IF GraspGen's asset base-link happens to coincide with the
+        # flange's own (zero-rotation) axes rather than the real hand's
+        # already-twisted ones - plausible for a generic dataset asset not
+        # calibrated to this specific robot's hand-mounting convention -
+        # then what we've been commanding as `fr3_hand`'s target
+        # orientation was actually the FLANGE's intended orientation. To
+        # get the flange to that same intended orientation despite
+        # fr3_hand's own built-in -45 deg twist, fr3_hand must be
+        # commanded to (that orientation) @ Rz(-45) - a RIGHT-multiply by
+        # -45, i.e. this parameter at -45.0. This is a derivation from one
+        # confirmed fact plus one unverified assumption about GraspGen's
+        # asset, not a certainty - if the real hand ends up worse/still
+        # diagonal, try +45.0 next (edit this default, same as every other
+        # tuning tonight - restart is a bare `ros2 run`, no -p flags, per
+        # RUNBOOK.md, so a command-line override here was silently
+        # ignored the first time this was tested). 0.0 reverts to the
+        # untouched historical behaviour. CHECK THE LOG each run for
+        # "Applied a ... deg correction" to confirm this value is actually
+        # the one that took effect before judging the result.
+        # WHERE IT'S APPLIED (fixed 2026-09-16, see execute_pick): ONLY to
+        # the single already-selected commanded pose, AFTER centering,
+        # width estimation and every gate have run on GraspGen's native
+        # (uncorrected) output - an earlier version applied it at load
+        # time and corrupted both (they assume "local X" is the true
+        # finger axis; a pre-rotated one sent the centering shift down a
+        # meaningless diagonal). Fixed by moving this to the last step.
+        # GATED BY ELONGATION (2026-09-17, real hardware regression). This
+        # value was derived and confirmed ONLY on a real banana. The very
+        # next session's real cube test showed the correction rotates the
+        # commanded grasp ~45 deg away from the cube's own edges - the
+        # finger-closing axis landed diagonally across a corner instead of
+        # straddling two flat faces, and execution TIMED_OUT (almost
+        # certainly the fingers/edge making contact on the way down). A
+        # banana has no flat-face constraint, so a 45 deg error there is
+        # invisible; a cube's 90 deg symmetry is close to the worst case
+        # for exactly this error, which is why it only showed up here.
+        # execute_pick() therefore applies this parameter's value ONLY when
+        # the object is elongated (the same crossaxis_min_elongation check
+        # the cross-axis preference uses) - a cube, bell pepper, or any
+        # other round/boxy object gets 0 deg regardless of this default.
+        # Keep the default at -45.0 (it stays the best evidence for
+        # elongated objects); do not widen the gate to cover boxy objects
+        # again without a real on-hardware confirmation for that shape.
+        self.declare_parameter("graspgen_frame_yaw_offset_deg", -45.0)
         self.declare_parameter("use_live_perception", True)
         self.declare_parameter("perception_host", "127.0.0.1")
         self.declare_parameter("perception_port", 5557)
@@ -206,7 +355,21 @@ class PragmabotBridge(Node):
         self.declare_parameter("lift_m", 0.12)
         self.declare_parameter("gripper_width", 0.0)
         self.declare_parameter("gripper_speed", 0.05)
-        self.declare_parameter("gripper_force", 20.0)
+        # RAISED 20 -> 40 N (2026-09-16, real banana pick): the grasp
+        # reported success and the new post-grasp width check (see
+        # _current_gripper_width) confirmed real material was actually
+        # between the fingers (not the empty-air false positive that
+        # check exists to catch) - it visibly held the banana while still
+        # on the table, then let go once the lift actually started. That
+        # points at insufficient FRICTION/force for a real, curved,
+        # slippery object under motion, not a detection or selection
+        # problem - the two-finger pinch on a round cross-section can act
+        # like a wedge and squeeze the object out under any lateral or
+        # vertical acceleration if the closing force is too low. Franka
+        # Hand's rated max grasp force is ~70 N; 40 N is a safe middle
+        # step, not the ceiling - raise further (toward 60-70) if it still
+        # slips during the lift specifically (not on the table).
+        self.declare_parameter("gripper_force", 40.0)
         self.declare_parameter("gripper_epsilon", 0.02)
         # Asymmetric on purpose - see _grasp(). inner small so an empty
         # close can never report success; outer generous because the width
@@ -354,10 +517,144 @@ class PragmabotBridge(Node):
         # elongated enough to trip the threshold.
         self.declare_parameter("crossaxis_grasp_weight", 0.6)
         self.declare_parameter("crossaxis_min_elongation", 1.6)
+        # HARD cap on top of the soft preference above (see
+        # grasp_transform.rank_grasp_indices docstring). VISUALLY
+        # CONFIRMED 2026-09-03 on a real banana: the commanded grasp's
+        # fingers closed at roughly a 45 deg diagonal to the banana's
+        # length instead of perpendicular to it - the soft weight alone
+        # let a confident-but-off-axis candidate win on that (stochastic)
+        # sampling call. Removes any candidate more than this many degrees
+        # off perfectly perpendicular before ranking by confidence. 0
+        # disables it.
+        self.declare_parameter("max_crossaxis_angle_deg", 20.0)
+        # STRICTER TILT GATE FOR ELONGATED OBJECTS. Three separate banana
+        # picks (2026-09-16, all Cartesian, no OMPL involved) all failed
+        # in the 24-26 deg tilt range - including one candidate with a
+        # near-perfect 0.4 deg cross-axis angle, ruling out grasp-quality
+        # as the cause. The common factor was tilt, not which candidate:
+        # the general 30 deg cone (max_grasp_tilt_deg) that has worked
+        # fine for cubes in past sessions is evidently too permissive for
+        # THIS object's geometry - a shallower/more-vertical approach both
+        # shortens the standoff-to-grasp Cartesian travel (less chance of
+        # crossing a singular region along that line) and reduces the
+        # sideways-sweep collision risk the hover waypoint already guards
+        # against for cubes. Applied ONLY when the cross-axis preference
+        # above is already engaged (elongation >= crossaxis_min_elongation)
+        # - cubes/round objects are untouched. 0 disables it (falls back to
+        # max_grasp_tilt_deg for elongated objects too, the old behaviour).
+        # RELOOSENED 15 -> 20 (2026-09-16): 15 deg shrank the surviving
+        # pool so much (13-19 candidates typical) that the width/span gate
+        # downstream had nothing left to pick from on 3 consecutive
+        # attempts (0 viable each time, GraspGen's diffusion sampling is
+        # stochastic so the pool differs every call) - "No usable grasp"
+        # even though earlier attempts at 15 deg DID find a good candidate
+        # when the draw was luckier. 20 deg still rules out the 24-26 deg
+        # range that caused every original singularity failure, while
+        # giving width more candidates per draw to find one that fits.
+        self.declare_parameter("elongated_max_grasp_tilt_deg", 20.0)
+        # HOW FAR FROM THE OBJECT'S MIDDLE (along ITS OWN long axis, i.e.
+        # object-frame-local X - not a world-frame position check) a grasp
+        # is allowed to land, as a fraction of the object's own half-length
+        # (0 = dead centre, 1 = right at an end). See the "POSITION ALONG
+        # THE LENGTH" comment in execute_pick - measured 2026-09-16 on a
+        # real banana photo: cross-axis ANGLE alone let through a grasp
+        # that was well-oriented but positioned right at the tip, where a
+        # curved object has both less material to grip and a local
+        # direction that can diverge from the whole-cloud long-axis
+        # average the angle gate is checked against. 0 disables this gate.
+        # STACKED WITH elongated_max_grasp_tilt_deg (15 deg): combined,
+        # 0.5 emptied the candidate list entirely on the real banana (0
+        # remained after both gates - "No usable grasp") - GraspGen's
+        # near-vertical (<=15 deg) samples for this object apparently
+        # cluster nearer the ends, not the middle. Loosened to 0.75 (only
+        # reject the outer 12.5% at each end) so the two gates can coexist;
+        # tune from the "Of N candidates past tilt/cross-axis: ... skipped
+        # for tip/end ... skipped for width/span" breakdown logged each
+        # attempt, not by re-guessing.
+        self.declare_parameter("max_grasp_length_offset_frac", 0.75)
+        # WRIST-ROTATION NORMALIZATION (ARMIN.md 2026-08-28, "Grasp
+        # selector accepts backhand (high-yaw) grasps"). A grasp and its
+        # 180 deg-about-approach-axis twin close on the exact same points
+        # on the object - nothing else in the pipeline distinguishes them
+        # - but one can demand a much more wound-up wrist to reach. Flips
+        # any candidate whose finger-closing axis points away from
+        # `wrist_neutral_x` (fixed base-frame direction, default +X /
+        # "forward") back toward it, before any gate/rank runs. Exact - it
+        # only changes which of two physically-identical grasps is used,
+        # not the grasp itself. Set False to run GraspGen's raw
+        # orientations unchanged.
+        # DISABLED BY DEFAULT (2026-09-16). Real banana test: with this on,
+        # ALL of the top 5 ranked candidates failed their hover+descend
+        # Cartesian plan at nearly the same fraction (0.983-0.996) -
+        # consistent with the flip systematically pushing every candidate
+        # toward the LESS reachable of the two symmetric orientations for
+        # this particular object placement, not the more reachable one.
+        # Root cause: `wrist_neutral_x` defaults to a FIXED world direction
+        # ([1,0,0]) with no reference to the arm's actual base position or
+        # current configuration - for this banana's orientation the
+        # finger-closing axis of the winning candidates sat only ~0.02-0.13
+        # from perpendicular to that fixed axis (logged standoff matrices,
+        # local-X[0] in that range for candidates 1-5) - i.e. the flip
+        # decision was being made on a near-zero, largely arbitrary signal
+        # for this geometry, not a meaningful "which way is the short wrist
+        # twist" answer. A fixed world axis is the wrong reference; the
+        # reference needs to depend on where the arm is reaching FROM (e.g.
+        # the horizontal direction from fr3_link0's origin to the object),
+        # not a constant. Re-enable only after that redesign - until then
+        # this can just as easily make an object LESS reachable as more.
+        self.declare_parameter("normalize_grasp_wrist_rotation", False)
+        self.declare_parameter("wrist_neutral_x", [1.0, 0.0, 0.0])
+        # REAL PER-OBJECT PLANE FIT for object_frame_T_base's Z axis /
+        # the tilt gate's table_normal (ARMIN.md 2026-09-03, "no real
+        # plane fit yet"). Replaces the hardcoded base +Z with
+        # grasp_transform.fit_plane_normal() run on the object's own
+        # cloud - matters for an object resting at an angle (propped
+        # against something), not for one lying flat on a level table
+        # (where the fit should land close to +Z anyway). `up_hint` for
+        # the fit's sign/sanity check is always base +Z regardless of
+        # this toggle. DISABLED BY DEFAULT (2026-09-16): tested on a real
+        # banana lying flat, fitted normal was 5.9 deg off vertical (as
+        # expected for a flat object on a level table - see the module
+        # docstring) and the pick still failed, on an unrelated Cartesian/
+        # IK issue in execute_pick's Step 2 (now fixed separately - see
+        # the "RETRY ACROSS CANDIDATES" comment below, which previously
+        # did not retry a Step-2 planning failure at all - it just
+        # aborted). A 5.9 deg shift is unlikely to have caused that
+        # failure, but flipping this off costs nothing for a flat-lying
+        # object and removes one variable while the Step-2 retry fix is
+        # verified on hardware. Re-enable (True) once that verification is
+        # clean AND you have a scenario with a genuinely tilted object to
+        # test against - a flat table gives this no chance to prove itself
+        # either way.
+        self.declare_parameter("fit_object_plane_normal", False)
+        # Sanity clamp on the fit above: if the fitted normal is more
+        # than this many degrees off base +Z, distrust it (almost
+        # certainly a noisy/contaminated cloud, not a genuinely tilted
+        # object) and fall back to +Z for that pick, with a warning
+        # logged. 0 disables the clamp - trust every fit.
+        self.declare_parameter("max_plane_tilt_deg", 35.0)
         # How many grasp candidates to try before giving up on the pick.
         # A pose can be a fine grasp yet have no IK solution for this arm;
         # the next candidate usually does.
         self.declare_parameter("max_grasp_attempts", 5)
+        # REORDER the candidates above by estimated joint-space distance
+        # from the arm's CURRENT configuration before trying them, closest
+        # first (see grasp_transform.config_distance() and the retry loop
+        # in execute_pick). WHY: the retry loop moves the real arm to each
+        # candidate's standoff in turn and does NOT return to a neutral
+        # pose between failed attempts - real picks (2026-09-17, carrot
+        # and banana) showed GraspGen's candidates can sit on opposite
+        # sides of the object (orientations ~180 deg apart), so trying
+        # them in raw confidence order can swing the waist/arm a lot
+        # between two back-to-back real motions with nothing selecting
+        # against it. This only changes the ORDER candidates already
+        # gated by tilt/width/confidence are tried in - never adds or
+        # removes a candidate. Costs one extra /compute_ik call per
+        # candidate (a few tens of ms each, capped at max_grasp_attempts)
+        # before the retry loop starts; set False to revert to pure
+        # confidence order if /compute_ik is unavailable or this makes
+        # things worse.
+        self.declare_parameter("prefer_nearby_grasp_candidate", True)
         # Slide each grasp onto the object's true centre along the
         # finger-closing axis (single-view centroid bias). Set false to
         # execute GraspGen's raw poses.
@@ -377,6 +674,21 @@ class PragmabotBridge(Node):
         # cube. Also lifts genuine tall-object grasps (bottle, pepper) off
         # their base, which is the safer place to hold them anyway.
         self.declare_parameter("max_grip_depth_m", 0.045)
+        # LOCAL vs GLOBAL top for the table-anchored grasp depth above
+        # (see the "LOCAL, NOT GLOBAL, TOP" comment in execute_pick).
+        # 2026-09-16: real banana picks with excellent orientation
+        # (cross-axis <10 deg, tilt <9 deg) still hit a TIMED_OUT
+        # execution fault and a reported contact - the global anchor
+        # assumes uniform height along the whole object, which a curved
+        # banana violates. True by default; set False to revert to the
+        # old single-global-plane behaviour if this makes things worse.
+        self.declare_parameter("local_grasp_depth_anchor", True)
+        # Radius (m, in the table/xy plane) of cloud points around each
+        # candidate's own position used to compute ITS local top. Small
+        # enough to track real curvature, large enough to average out
+        # stereo noise - falls back to the global top if fewer than 15
+        # points fall inside it (e.g. a very thin/tapered part).
+        self.declare_parameter("local_top_radius_m", 0.025)
         # --- Empirical calibration correction (see execute_pick, applied to
         # T_base_from_cam right after the TF lookup) - measured 2026-08-26
         # via a hand-guided touch-test against fr3_zed_right.calib: bias was
@@ -695,6 +1007,23 @@ class PragmabotBridge(Node):
 
         grasps_T_base = T_base_from_cam @ grasps_T_cam
 
+        # Normalize away the 180 deg "backhand" wrist ambiguity (see
+        # declare_parameter comment above and grasp_transform docstring)
+        # BEFORE anything below reads orientation - tilt gate, cross-axis
+        # angle, depth anchoring and IK should all see the same, already
+        # wrist-sane candidate a later step might pick.
+        if bool(self.get_parameter("normalize_grasp_wrist_rotation").value):
+            _wrist_neutral_x = np.array(
+                self.get_parameter("wrist_neutral_x").value, dtype=np.float64)
+            grasps_T_base, _n_flipped = grasp_transform.normalize_grasp_wrist_rotation(
+                grasps_T_base, neutral_x=_wrist_neutral_x)
+            if _n_flipped:
+                self.get_logger().info(
+                    f"Wrist-rotation normalization flipped {_n_flipped}/"
+                    f"{len(grasps_T_base)} grasp candidates 180 deg about their "
+                    "own approach axis to avoid a wound-up wrist"
+                )
+
         # ANCHOR GRASP DEPTH TO THE TABLE, NOT TO THE CLOUD.
         # The camera-frame correction above sets depth from the object
         # cloud's own extent along the approach axis - and that extent is
@@ -731,21 +1060,63 @@ class PragmabotBridge(Node):
                 if _capped:
                     _tip_target = _top_bounded
 
+                # LOCAL, NOT GLOBAL, TOP - for a curved/non-uniform-height
+                # object (real banana, 2026-09-16). The block above computes
+                # ONE global 98th-percentile top and applies the SAME
+                # absolute z target to every candidate everywhere along the
+                # object - a fine approximation for a cube or a straight
+                # object, where local height barely varies, but a strongly
+                # curved banana's height at the ACTUAL grasp (x,y) location
+                # can differ a lot from the object's overall max. Repeated
+                # real picks with excellent orientation (cross-axis <10 deg,
+                # tilt <9 deg, confirmed both in the log and independently
+                # in the offline viser visualization) still ended in a
+                # TIMED_OUT execution fault and a reported hit on the
+                # banana - i.e. the remaining problem is no longer WHICH
+                # WAY the grasp points, it's WHERE THE FINGERTIPS ARE AIMED
+                # vertically for that specific spot. This recomputes the
+                # top from only the cloud points within
+                # `local_top_radius_m` of each candidate's own (x,y) -
+                # local ~= global for a flat/uniform object (no regression
+                # there), but tracks a curved one instead of a single
+                # object-wide plane. Falls back to the global anchor above
+                # if too few local points are found (a thin/tapered part of
+                # the object) or the toggle is off.
+                _use_local = bool(self.get_parameter("local_grasp_depth_anchor").value)
+                _local_r = float(self.get_parameter("local_top_radius_m").value)
+                _local_used = 0
+
                 _depth = 0.10527314
                 _fixed = grasps_T_base.copy()
                 for _i in range(len(_fixed)):
                     _a = _fixed[_i, :3, 2]
                     if abs(_a[2]) < 0.3:      # near-horizontal: no sane tip height
                         continue
+                    _cand_target = _tip_target
+                    if _use_local and _local_r > 0.0:
+                        _cxy = _fixed[_i, :2, 3]
+                        _d2 = np.sum((_pb[:, :2] - _cxy) ** 2, axis=1)
+                        _nearby = _pb[_d2 <= _local_r * _local_r, 2]
+                        if len(_nearby) >= 15:
+                            _local_top = float(np.percentile(_nearby, 98))
+                            _local_height = max(_local_top - _table, 0.0)
+                            _cand_target = _table + float(
+                                np.clip(_frac * _local_height, 0.008, 0.022))
+                            _local_top_bounded = _local_top - _max_depth
+                            if _local_top_bounded > _cand_target:
+                                _cand_target = _local_top_bounded
+                            _local_used += 1
                     _tip_z = _fixed[_i, 2, 3] + _depth * _a[2]
-                    _s = float(np.clip((_tip_target - _tip_z) / _a[2], -0.05, 0.05))
+                    _s = float(np.clip((_cand_target - _tip_z) / _a[2], -0.05, 0.05))
                     _fixed[_i, :3, 3] = _fixed[_i, :3, 3] + _a * _s
                 grasps_T_base = _fixed
                 self.get_logger().info(
-                    f"Grasp depth anchored to the {'object top (merged/tall cloud)' if _capped else 'table'}: "
-                    f"object top z={_top:.4f}, table z={_table:.4f}, "
+                    f"Grasp depth anchored to the {'object top (merged/tall cloud)' if _capped else 'table'} "
+                    f"(global fallback): object top z={_top:.4f}, table z={_table:.4f}, "
                     f"fingertips targeted at z={_tip_target:.4f} "
                     f"({(_top - _tip_target) * 1000:.0f} mm of grip)"
+                    + (f" - {_local_used}/{len(_fixed)} candidates got a LOCAL "
+                       f"top instead (radius {_local_r * 100:.1f} cm)" if _use_local else "")
                 )
             except Exception as exc:  # noqa: BLE001 - never block a pick
                 self.get_logger().warn(f"Table-anchored depth skipped: {exc}")
@@ -768,32 +1139,123 @@ class PragmabotBridge(Node):
             max_attempts = int(self.get_parameter("max_grasp_attempts").value)
             viable: list[int] = []
 
-            # Cross-axis preference for elongated objects. Compute the
-            # cloud's horizontal long axis in BASE frame (rank_grasp_indices
-            # works in base frame); only engage it when the footprint is
-            # actually elongated, so cubes/round objects are unaffected.
+            # Per-object coordinate frame (grasp_transform.object_frame_T_base):
+            # origin at the cloud's centroid, Z the plane the object sits
+            # on (table_normal, default straight up in fr3_link0), X its
+            # own long axis. Computed whenever the object cloud is
+            # available - not just for elongated objects - so it can be
+            # (a) published to TF and seen in rviz, and (b) fed back into
+            # rank_grasp_indices as `table_normal` below, so "which side is
+            # the correct approach side" is answered by this object's own
+            # plane rather than merely assumed to be base +Z for every
+            # object. `table_normal` is left at the default (base +Z) for
+            # now - this table-mounted setup has no tilted surfaces to
+            # fit a real plane against yet - but the gate is wired to this
+            # frame's Z axis rather than a bare constant, so a real plane
+            # fit can be dropped in later with no caller-side change.
             _long_axis = None
+            _long_origin = None
+            _long_half_len = 0.0
+            _long_mid_offset = 0.0
+            _table_normal = np.array([0.0, 0.0, 1.0])
             _xw = float(self.get_parameter("crossaxis_grasp_weight").value)
-            if _xw > 0.0 and object_pcd_file:
+            # Whether THIS object is elongated enough to engage the
+            # cross-axis machinery. Also used to gate graspgen_frame_yaw_
+            # offset_deg below: that correction was derived and confirmed
+            # ONLY on a real banana (2026-09-16) - a real cube test the next
+            # day showed it rotates the commanded grasp ~45 deg away from
+            # the cube's own edges (fingers landed diagonally across a
+            # corner instead of straddling two flat faces, execution
+            # TIMED_OUT). A banana has no flat-face constraint so a 45 deg
+            # error there is invisible; a cube's 90 deg symmetry makes it
+            # the worst case for exactly this error. Defaults to False
+            # (no yaw correction) until elongation is established below, so
+            # a boxy/round object never gets a correction that was never
+            # validated for its shape.
+            _is_elongated = False
+            if object_pcd_file:
                 try:
                     _pc = np.load(object_pcd_file).astype(np.float64)[:, :3]
                     _pb = (T_base_from_cam[:3, :3] @ _pc.T).T + T_base_from_cam[:3, 3]
                     _axis, _elong = grasp_transform.principal_axis_xy(_pb)
-                    if _elong >= float(self.get_parameter("crossaxis_min_elongation").value):
-                        _long_axis = _axis
-                        self.get_logger().info(
-                            f"Elongated object (footprint {_elong:.1f}:1) - "
-                            "preferring grasps that close across its long axis"
-                        )
-                except Exception as exc:  # noqa: BLE001 - never block a pick
-                    self.get_logger().warn(f"Cross-axis grasp preference skipped: {exc}")
+                    _is_elongated = _elong >= float(
+                        self.get_parameter("crossaxis_min_elongation").value)
 
+                    if bool(self.get_parameter("fit_object_plane_normal").value):
+                        _fitted_normal = grasp_transform.fit_plane_normal(
+                            _pb, up_hint=np.array([0.0, 0.0, 1.0]))
+                        _tilt_from_up = float(np.degrees(np.arccos(
+                            np.clip(_fitted_normal[2], -1.0, 1.0))))
+                        _max_plane_tilt = float(self.get_parameter("max_plane_tilt_deg").value)
+                        if _max_plane_tilt > 0.0 and _tilt_from_up > _max_plane_tilt:
+                            self.get_logger().warn(
+                                f"Fitted object plane normal is {_tilt_from_up:.1f} deg off "
+                                f"vertical (> {_max_plane_tilt:.0f} deg cap) - likely a noisy/"
+                                "contaminated cloud, not a genuinely tilted object; falling "
+                                "back to straight up for this pick"
+                            )
+                        else:
+                            _table_normal = _fitted_normal
+                            self.get_logger().info(
+                                f"Object plane normal fit: {_table_normal} "
+                                f"({_tilt_from_up:.1f} deg off vertical)"
+                            )
+
+                    _obj_frame = grasp_transform.object_frame_T_base(
+                        _pb, long_axis=_axis, table_normal=_table_normal)
+                    self._broadcast_object_frame(_obj_frame)
+
+                    if _is_elongated:
+                        _elongated_tilt = float(
+                            self.get_parameter("elongated_max_grasp_tilt_deg").value)
+                        if _elongated_tilt > 0.0 and _elongated_tilt < max_tilt_deg:
+                            self.get_logger().info(
+                                f"Elongated object (footprint {_elong:.1f}:1) - tightening "
+                                f"the tilt gate to {_elongated_tilt:.0f} deg (from "
+                                f"{max_tilt_deg:.0f} deg) - shallow/tilted approaches have "
+                                "repeatedly failed the Cartesian descent for this shape"
+                            )
+                            max_tilt_deg = _elongated_tilt
+                        if _xw > 0.0:
+                            _long_axis = _axis
+                            self.get_logger().info(
+                                "Preferring grasps that close across the object's long axis"
+                            )
+
+                        # POSITION ALONG THE LENGTH, IN THE OBJECT'S OWN
+                        # FRAME - not a world/base-frame check (2026-09-16,
+                        # real banana photo: the selected grasp's ANGLE was
+                        # a near-perfect 8.1 deg off perpendicular to the
+                        # whole-object long axis, yet physically the
+                        # fingers landed near the tip, not the middle - a
+                        # curved object's LOCAL direction at one end can
+                        # differ a lot from the single global PCA axis
+                        # fitted over the whole cloud, and the tip is also
+                        # thinner/less material to grip. The cross-axis
+                        # ANGLE gate alone cannot catch this - it only
+                        # checks orientation, never WHERE along the object
+                        # the grasp sits. This measures each candidate's
+                        # position by projecting it onto the object frame's
+                        # own X axis (the long axis) and expressing it as a
+                        # fraction of the object's own half-length - a
+                        # value computed and gated entirely in the object's
+                        # coordinates, not the world's.
+                        _long_origin = _obj_frame[:3, 3]
+                        _lx_all = (_pb - _long_origin) @ _axis
+                        _long_half_len = float(_lx_all.max() - _lx_all.min()) / 2.0
+                        _long_mid_offset = float(_lx_all.max() + _lx_all.min()) / 2.0
+                except Exception as exc:  # noqa: BLE001 - never block a pick
+                    self.get_logger().warn(f"Object frame / cross-axis preference skipped: {exc}")
+
+            _max_xa = float(self.get_parameter("max_crossaxis_angle_deg").value)
             ranked = grasp_transform.rank_grasp_indices(
                 grasps_T_base, confidences,
                 min_confidence=float(self.get_parameter("min_grasp_confidence").value),
                 max_tilt_deg=max_tilt_deg,
+                table_normal=_table_normal,
                 object_long_axis=_long_axis,
                 crossaxis_weight=_xw,
+                max_crossaxis_angle_deg=_max_xa,
             )
             grasp_index = int(ranked[0]) if len(ranked) else -1
 
@@ -809,6 +1271,15 @@ class PragmabotBridge(Node):
             min_width = float(self.get_parameter("min_gripper_width").value)
             max_width = float(self.get_parameter("max_gripper_width").value)
             max_span = float(self.get_parameter("max_object_span").value)
+            _max_len_off = float(self.get_parameter("max_grasp_length_offset_frac").value)
+            _len_skipped = 0
+            _width_skipped = 0
+            _thin_skipped = 0
+            if len(ranked):
+                self.get_logger().info(
+                    f"{len(ranked)} candidate(s) passed the tilt"
+                    f"{'/cross-axis' if _long_axis is not None else ''} gate(s)"
+                )
             if len(ranked) and gripper_width <= 0.0 and object_pcd_file and min_width > 0.0:
                 pcd_cam_probe = np.load(object_pcd_file).astype(np.float64)[:, :3]
                 for rank, cand in enumerate(ranked):
@@ -816,6 +1287,7 @@ class PragmabotBridge(Node):
                         w = grasp_transform.estimate_gripper_width(
                             pcd_cam_probe, grasps_T_cam[cand])
                     except ValueError:
+                        _thin_skipped += 1
                         continue  # too few points in the contact band
                     # FEASIBILITY, not just contact width. `w` is measured
                     # in the fingertip band and under-reads badly on a
@@ -828,7 +1300,23 @@ class PragmabotBridge(Node):
                     _lx = (pcd_cam_probe - grasps_T_cam[cand][:3, 3]) @ grasps_T_cam[cand][:3, 0]
                     span = float(_lx.max() - _lx.min())
                     if span > max_span:
+                        _width_skipped += 1
                         continue
+                    # POSITION-ALONG-LENGTH GATE, in the object's own frame
+                    # (see the comment where _long_half_len is computed
+                    # above). Rejects a candidate whose grasp point sits
+                    # too close to either end of the object along ITS OWN
+                    # long axis - orientation alone (the cross-axis angle
+                    # gate) does not catch a well-angled grasp landing on
+                    # the thin/curved tip of a banana rather than its body.
+                    if (_long_axis is not None and _max_len_off > 0.0
+                            and _long_half_len > 1e-6):
+                        _cand_pos = grasps_T_base[cand][:3, 3]
+                        _cand_lx = float((_cand_pos - _long_origin) @ _long_axis)
+                        _off_frac = abs((_cand_lx - _long_mid_offset) / _long_half_len)
+                        if _off_frac > _max_len_off:
+                            _len_skipped += 1
+                            continue
                     if min_width <= w <= max_width:
                         viable.append(int(cand))
                         if len(viable) == 1 and rank:
@@ -840,18 +1328,60 @@ class PragmabotBridge(Node):
                             )
                         if len(viable) >= max_attempts:
                             break
+                    else:
+                        _width_skipped += 1
+                if _len_skipped or _width_skipped or _thin_skipped:
+                    self.get_logger().info(
+                        f"Of {len(ranked)} candidates past tilt/cross-axis: "
+                        f"{_len_skipped} skipped for sitting too close to a "
+                        f"tip/end (> {_max_len_off * 100:.0f}% of the object's "
+                        f"own half-length off-centre), {_width_skipped} for "
+                        "width/span out of range, "
+                        f"{_thin_skipped} too thin to measure a contact band, "
+                        f"{len(viable)} remained viable"
+                    )
                 if viable:
                     grasp_index = viable[0]
                 else:
                     self._fail_log(
                         f"No usable grasp: every candidate either closes on "
                         f"less than {min_width * 1000:.0f} mm (the visible "
-                        "shell edge-on, not the object), or the object spans "
-                        f"more than {max_span * 1000:.0f} mm across the "
-                        "fingers - the hand opens to 80 mm and cannot get "
-                        "around it. THIS OBJECT IS TOO LARGE FOR THIS "
-                        "GRIPPER; pick a smaller one rather than retrying."
+                        "shell edge-on, not the object), spans more than "
+                        f"{max_span * 1000:.0f} mm across the fingers - the "
+                        "hand opens to 80 mm and cannot get around it - or, "
+                        "for an elongated object, sits too close to a tip/end "
+                        "to grip reliably (see the per-cause breakdown logged "
+                        "just above this). If the tip/end count dominates, "
+                        "loosen max_grasp_length_offset_frac; if width/span "
+                        "dominates, THIS OBJECT IS TOO LARGE FOR THIS GRIPPER "
+                        "- pick a smaller one rather than retrying."
                     )
+                    # DIAGNOSTIC-ONLY marker, published even on this abort
+                    # path (2026-09-16) - width/span rejecting every single
+                    # candidate meant NOTHING ever reached the retry loop's
+                    # broadcast, so a run like this published no marker at
+                    # all: no way to check a hypothesis (e.g. the -45 deg
+                    # frame-yaw correction) in rviz without a lucky draw
+                    # that happens to also pass width. Safe unconditionally
+                    # - this function returns False right after, so no
+                    # motion is ever commanded for whatever gets drawn
+                    # here; it is for LOOKING ONLY. Uses the best
+                    # tilt/cross-axis survivor even though it failed width,
+                    # purely so there is something to inspect.
+                    if len(ranked):
+                        try:
+                            _diag_grasps = grasps_T_base.copy()
+                            _diag_yaw = float(
+                                self.get_parameter("graspgen_frame_yaw_offset_deg").value
+                            ) if _is_elongated else 0.0
+                            if _diag_yaw != 0.0:
+                                _diag_grasps[int(ranked[0])] = grasp_transform.rotate_about_local_z(
+                                    _diag_grasps[int(ranked[0])][None], _diag_yaw)[0]
+                            self._broadcast_grasp_markers(
+                                _diag_grasps, int(ranked[0]), ranked,
+                                gripper_width if gripper_width > 0.0 else 0.05)
+                        except Exception as exc:  # noqa: BLE001 - diagnostics only
+                            self.get_logger().warn(f"Diagnostic grasp markers skipped: {exc}")
                     return False
 
             if not viable and len(ranked):
@@ -859,24 +1389,29 @@ class PragmabotBridge(Node):
                 grasp_index = viable[0]
 
             if grasp_index < 0:
-                # select_grasp_index's tilt gate fails CLOSED (see its
-                # docstring): -1 means every candidate was more than
-                # max_tilt_deg off perpendicular, not "pick the least-bad
-                # one anyway". This message goes into the planner's
-                # self-reflection the same way every other execute_pick
-                # failure does (_fail_log), so it needs to suggest
-                # something the planner can actually act on next - here,
-                # that the OBJECT's pose is the problem, not the grasp/
-                # trajectory/gripper, since no near-vertical approach
-                # existed for it in this orientation at all.
+                # rank_grasp_indices' tilt gate and cross-axis angle gate
+                # both fail CLOSED (see their docstrings): -1 means every
+                # candidate was excluded by one of them, not "pick the
+                # least-bad one anyway". This message goes into the
+                # planner's self-reflection the same way every other
+                # execute_pick failure does (_fail_log), so it needs to
+                # suggest something the planner can actually act on next -
+                # here, that the OBJECT's pose is the problem, not the
+                # grasp/trajectory/gripper, since no safe approach existed
+                # for it in this orientation at all.
+                _reason = (
+                    f"within {max_tilt_deg:.0f} deg of perpendicular to the "
+                    "table with the fingers close to across its long axis"
+                    if _long_axis is not None else
+                    f"within {max_tilt_deg:.0f} deg of perpendicular to the table"
+                )
                 self._fail_log(
-                    f"No grasp candidate within {max_tilt_deg:.0f} deg of "
-                    "perpendicular to the table - GraspGen did not offer a "
-                    "safe top-down approach for this object in its current "
-                    "pose. Try reorienting or repositioning the object "
-                    "(e.g. standing it more upright, or turning it so a "
-                    "flatter surface faces up) before retrying, rather "
-                    "than repeating the same pick."
+                    f"No grasp candidate {_reason} - GraspGen did not offer "
+                    "a safe approach for this object in its current pose. "
+                    "Try reorienting or repositioning the object (e.g. "
+                    "standing it more upright, or turning it so a flatter "
+                    "surface faces up) before retrying, rather than "
+                    "repeating the same pick."
                 )
                 return False
 
@@ -922,6 +1457,23 @@ class PragmabotBridge(Node):
                     f"as the most top-down candidate (no confidences available, "
                     f"tilt {tilt_deg:.1f} deg from vertical)"
                 )
+
+            # Diagnostic visibility (2026-09-03): log the cross-axis angle
+            # of the FINAL selected grasp (after the width gate may have
+            # walked past the initial top candidate), so a diagonal pinch
+            # is visible in the log regardless of whether the hard gate
+            # above is enabled. Never blocks a pick: purely informational.
+            if _long_axis is not None:
+                try:
+                    _xa = float(grasp_transform.crossaxis_angle_deg(
+                        grasps_T_base[grasp_index:grasp_index + 1], _long_axis)[0])
+                    self.get_logger().info(
+                        f"Selected grasp's cross-axis angle: {_xa:.1f} deg "
+                        "off perpendicular to the object's long axis "
+                        "(0=ideal crosswise pinch, 90=worst-case lengthwise)"
+                    )
+                except Exception as exc:  # noqa: BLE001 - logging only
+                    self.get_logger().warn(f"Cross-axis angle logging skipped: {exc}")
         elif grasp_index >= len(grasps_T_cam):
             self._fail_log(
                 f"grasp_index={grasp_index} out of range (grasp_file has "
@@ -931,6 +1483,42 @@ class PragmabotBridge(Node):
 
         grasp_T_cam = grasps_T_cam[grasp_index]
         grasp_T_base = grasps_T_base[grasp_index]
+
+        # SUSPECTED GRASPGEN-ASSET vs REAL fr3_hand FRAME OFFSET (see
+        # grasp_transform.rotate_about_local_z's docstring). Applied HERE -
+        # to the single already-selected commanded pose, AFTER centering,
+        # width estimation and every gate have all run on GraspGen's own
+        # native (uncorrected) geometry - and NOT earlier. A 2026-09-16
+        # attempt to apply this at load time, before center_grasp_on_object
+        # and estimate_gripper_width, corrupted both: they project onto
+        # "local X" assuming it is the true finger-closing axis, and a
+        # pre-rotated local X sent the centering shift down a meaningless
+        # diagonal (a real banana's grasp marker ended up hovering off the
+        # object's tip in rviz, and nearly every candidate started reading
+        # as the wrong width - not evidence against the 45 deg hypothesis
+        # itself, just proof it must be applied at the very end). 0.0 (the
+        # parameter default) = no change; this only ever affects the final
+        # command and the rviz marker, never selection.
+        # GATED BY ELONGATION (2026-09-17): this correction was validated
+        # only on a real banana; a real cube test showed it rotates the
+        # commanded grasp ~45 deg off the cube's own edges (diagonal
+        # approach, hit the edge, execution TIMED_OUT). _is_elongated is
+        # False for anything that didn't clear crossaxis_min_elongation
+        # (cubes, bell peppers, round/boxy objects in general), so those
+        # now get 0 deg regardless of the parameter's own value - only an
+        # elongated object (banana, carrot) gets the correction applied.
+        _yaw_offset = float(
+            self.get_parameter("graspgen_frame_yaw_offset_deg").value
+        ) if _is_elongated else 0.0
+        if _yaw_offset != 0.0:
+            grasp_T_base = grasp_transform.rotate_about_local_z(
+                grasp_T_base[None], _yaw_offset)[0]
+            self.get_logger().info(
+                f"Applied a {_yaw_offset:+.0f} deg correction to the commanded "
+                "orientation only (graspgen_frame_yaw_offset_deg) - elongated "
+                "object, selection/centering/width were all computed before this"
+            )
+
         standoff_T_base = grasp_transform.standoff_pose(grasp_T_base, standoff_m)
 
         if gripper_width <= 0.0 and object_pcd_file:
@@ -983,40 +1571,189 @@ class PragmabotBridge(Node):
         # pipeline look intermittent. Only PLANNING failures fall through
         # to the next candidate; a failure while the arm is actually
         # moving still aborts, since the arm is then somewhere unknown.
+        #
+        # COVERS BOTH STEP 1 (reach the standoff) AND STEP 2 (hover+descend
+        # into the grasp) - measured 2026-09-16 on a real banana: standoff
+        # was reachable, but the hover+descend Cartesian plan for that same
+        # candidate came back at fraction=0.983 (a PLANNING failure, no
+        # motion attempted) and the pick aborted anyway with a message that
+        # literally said "pick a different grasp candidate" - because until
+        # now that retry only covered Step 1. A grasp whose STANDOFF is
+        # reachable is not guaranteed to have a reachable DESCENT too (the
+        # two differ by up to `standoff_m` of horizontal travel for a
+        # tilted grasp - see the hover-waypoint comment below), so Step 2
+        # needs the same fall-through-to-next-candidate treatment Step 1
+        # already had.
         attempts = viable if viable else [grasp_index]
+
+        # PREFER THE NEAREST CANDIDATE, NOT JUST THE NEXT-BEST BY
+        # CONFIDENCE (2026-09-17). The loop below moves the REAL arm to
+        # each candidate's standoff in turn and does NOT return to a
+        # neutral pose between failed attempts. Real picks (carrot,
+        # banana) showed GraspGen's candidates can sit on opposite sides
+        # of the object - orientations ~180 deg apart - so trying them in
+        # raw confidence order can swing the waist/arm a lot between two
+        # back-to-back real motions, with nothing selecting against it.
+        # This only reorders candidates ALREADY gated by tilt/width/
+        # confidence above - it never adds or removes one. Ranking uses
+        # grasp_transform.config_distance() (written for exactly this,
+        # never wired in until now) against an IK estimate of each
+        # candidate's standoff, seeded from the arm's actual current
+        # joint state. Falls back to the untouched confidence order if
+        # the arm's joint state isn't available (e.g. arm_joint_states_
+        # topic misconfigured) - see _current_arm_joint_positions().
+        if (bool(self.get_parameter("prefer_nearby_grasp_candidate").value)
+                and len(attempts) > 1):
+            _current_q = self._current_arm_joint_positions()
+            if _current_q is None:
+                self.get_logger().warn(
+                    "prefer_nearby_grasp_candidate is on but no current arm "
+                    "joint state is available (check arm_joint_states_topic) "
+                    "- trying candidates in confidence order instead"
+                )
+            else:
+                _joint_names = list(_current_q)
+                _current_vec = [_current_q[n] for n in _joint_names]
+                _scored = []
+                for _cand in attempts:
+                    _cand_T = grasps_T_base[int(_cand)]
+                    if _yaw_offset != 0.0:
+                        _cand_T = grasp_transform.rotate_about_local_z(
+                            _cand_T[None], _yaw_offset)[0]
+                    _cand_standoff = grasp_transform.standoff_pose(_cand_T, standoff_m)
+                    _cand_q = self._solve_ik(
+                        group_name, eef_link,
+                        grasp_transform.matrix_to_pose(_cand_standoff))
+                    if _cand_q is None or not all(n in _cand_q for n in _joint_names):
+                        _scored.append((float("inf"), _cand))  # unknown - try last
+                        continue
+                    _dist = grasp_transform.config_distance(
+                        _current_vec, [_cand_q[n] for n in _joint_names])
+                    _scored.append((_dist, _cand))
+                _scored.sort(key=lambda x: x[0])
+                attempts = [c for _, c in _scored]
+                _finite = [d for d, _ in _scored if np.isfinite(d)]
+                if _finite:
+                    self.get_logger().info(
+                        f"Reordered {len(attempts)} candidate(s) by estimated "
+                        f"joint motion from the arm's current position "
+                        f"(closest {min(_finite):.2f} rad, farthest "
+                        f"{max(_finite):.2f} rad away) - trying the nearest "
+                        "first to avoid an unnecessary swing between attempts"
+                    )
+
         reached = False
+        grasp_pose_msg = hover_pose_msg = None
         for attempt_n, cand in enumerate(attempts):
-            if attempt_n:
+            if attempt_n or int(cand) != grasp_index:
                 grasp_index = int(cand)
                 grasp_T_cam = grasps_T_cam[grasp_index]
                 grasp_T_base = grasps_T_base[grasp_index]
+                if _yaw_offset != 0.0:
+                    grasp_T_base = grasp_transform.rotate_about_local_z(
+                        grasp_T_base[None], _yaw_offset)[0]
                 standoff_T_base = grasp_transform.standoff_pose(grasp_T_base, standoff_m)
                 self.get_logger().warn(
-                    f"Standoff unreachable - trying candidate {attempt_n + 1}"
-                    f"/{len(attempts)} (grasp {grasp_index})"
+                    f"Trying candidate {attempt_n + 1}/{len(attempts)} "
+                    f"(grasp {grasp_index})"
                 )
                 self.get_logger().info(f"standoff pose (fr3_link0):\n{standoff_T_base}")
 
             standoff_pose_msg = grasp_transform.matrix_to_pose(standoff_T_base)
             cart = self._compute_cartesian_path(group_name, eef_link, [standoff_pose_msg])
+            standoff_reached = False
             if cart is not None and cart.fraction >= 1.0:
                 if not self._execute_trajectory(cart.solution):
                     self._fail_log("Cartesian path to standoff pose failed to execute - aborting")
                     return False
-                reached = True
-                break
-            if self._move_to_pose(group_name, eef_link, standoff_pose_msg):
-                reached = True
-                break
+                standoff_reached = True
+            elif self._move_to_pose(group_name, eef_link, standoff_pose_msg):
+                standoff_reached = True
+
+            if not standoff_reached:
+                continue  # this candidate's standoff itself is unreachable
+
+            # BROADCAST HERE, NOT BEFORE THE RETRY LOOP (2026-09-16 fix): a
+            # marker published before this loop started would show the
+            # FIRST candidate tried even if the retry loop later moved on
+            # to a different one - exactly the "45 deg different between
+            # what's shown and what the robot does" mismatch reported on
+            # a real run. Called fresh on every attempt that reaches its
+            # standoff, so it updates live as retries happen, and is
+            # guaranteed correct for whichever candidate ultimately wins
+            # (the last one broadcast before the loop breaks).
+            try:
+                _cands = locals().get('viable') or locals().get('ranked') or []
+                # Candidate context arrows stay on GraspGen's own native
+                # output (unaffected diagnostic). Only the ONE selected
+                # index is swapped for the (possibly yaw-corrected)
+                # `grasp_T_base` actually about to be commanded, so the
+                # magenta icon always matches reality, not a re-indexed
+                # uncorrected copy.
+                _grasps_for_marker = grasps_T_base.copy()
+                _grasps_for_marker[grasp_index] = grasp_T_base
+                self._broadcast_grasp_markers(_grasps_for_marker, grasp_index, _cands, gripper_width)
+            except Exception as exc:  # noqa: BLE001 - never block a pick on a viz call
+                self.get_logger().warn(f"Grasp candidate markers skipped: {exc}")
+
+            # Step 2: approach into the grasp pose via a HOVER waypoint, not
+            # a single straight line from standoff.
+            #
+            # WHY (measured 2026-08-26, real cube, hit its top surface
+            # twice in a row). standoff_pose() backs the standoff off along
+            # the grasp's OWN approach axis (grasp_transform.standoff_pose)
+            # - for a tilted grasp that axis has a horizontal component, so
+            # standoff and grasp differ in x/y AND z at once. A single
+            # straight line between them therefore descends and slides
+            # sideways simultaneously: one real trial measured (dx=+15mm,
+            # dy=-27mm, dz=-116mm) over a 120mm move (matches the reported
+            # 15 deg tilt: sin(15)*120mm = 31mm of sideways drift). The
+            # object's own footprint was only ~40-50mm across, so for part
+            # of that descent the gripper was still sliding into its final
+            # x/y position while already BELOW the object's top-surface
+            # height - a geometric collision with the cube's top, not a
+            # perception or calibration error. This gets WORSE at higher
+            # tilt (more sideways drift per mm of descent), which is
+            # exactly the direction things got worse when testing steeper
+            # tilts.
+            #
+            # THE FIX. Insert a waypoint directly above the grasp target -
+            # same x/y as the grasp, but at the standoff's (safely
+            # elevated) z - so horizontal centering happens first, at a
+            # height well clear of the object, and the final descent is a
+            # pure vertical drop straight down onto the already-centred
+            # position. This decouples "get over the object" from "go down
+            # onto it" instead of doing both at once along a diagonal.
+            grasp_pose_msg = grasp_transform.matrix_to_pose(grasp_T_base)
+            hover_T_base = grasp_T_base.copy()
+            hover_T_base[2, 3] = standoff_T_base[2, 3]
+            hover_pose_msg = grasp_transform.matrix_to_pose(hover_T_base)
+            cart = self._compute_cartesian_path(
+                group_name, eef_link, [hover_pose_msg, grasp_pose_msg])
+            if cart is None or cart.fraction < 1.0:
+                frac = None if cart is None else cart.fraction
+                self.get_logger().warn(
+                    f"Hover+descend path for candidate {attempt_n + 1}/{len(attempts)} "
+                    f"(grasp {grasp_index}) incomplete (fraction={frac}) - the standoff "
+                    "was reachable but this descent is not; trying the next candidate "
+                    "instead of aborting (arm has not moved past the standoff)"
+                )
+                continue
+
+            if not self._execute_trajectory(cart.solution):
+                self._fail_log("Cartesian approach execution failed - aborting")
+                return False
+            reached = True
+            break
 
         if not reached:
             self._fail_log(
-                f"Failed to reach the standoff pose for any of {len(attempts)} "
-                "grasp candidates - every near-vertical, correctly-sized grasp "
-                "for this object is outside the arm's reachable workspace from "
-                "its current configuration. Move the object closer to the "
-                "centre of the table, or move the arm to a different starting "
-                "pose, before retrying."
+                f"Failed to reach BOTH a standoff AND a full hover+descend path for "
+                f"any of {len(attempts)} grasp candidates - every near-vertical, "
+                "correctly-sized grasp for this object is outside the arm's reachable "
+                "workspace from its current configuration, or passes near a "
+                "singularity on descent. Move the object closer to the centre of the "
+                "table, or move the arm to a different starting pose, before retrying."
             )
             return False
 
@@ -1033,87 +1770,37 @@ class PragmabotBridge(Node):
             except ValueError as exc:
                 self.get_logger().warn(f"Could not re-estimate gripper width: {exc}")
 
-        # Step 2: approach into the grasp pose via a HOVER waypoint, not a
-        # single straight line from standoff.
-        #
-        # WHY (measured 2026-08-26, real cube, hit its top surface twice in
-        # a row). standoff_pose() backs the standoff off along the grasp's
-        # OWN approach axis (grasp_transform.standoff_pose) - for a tilted
-        # grasp that axis has a horizontal component, so standoff and grasp
-        # differ in x/y AND z at once. A single straight line between them
-        # therefore descends and slides sideways simultaneously: one real
-        # trial measured (dx=+15mm, dy=-27mm, dz=-116mm) over a 120mm move
-        # (matches the reported 15 deg tilt: sin(15)*120mm = 31mm of
-        # sideways drift). The object's own footprint was only ~40-50mm
-        # across, so for part of that descent the gripper was still
-        # sliding into its final x/y position while already BELOW the
-        # object's top-surface height - a geometric collision with the
-        # cube's top, not a perception or calibration error. This gets
-        # WORSE at higher tilt (more sideways drift per mm of descent),
-        # which is exactly the direction things got worse when testing
-        # steeper tilts.
-        #
-        # THE FIX. Insert a waypoint directly above the grasp target -
-        # same x/y as the grasp, but at the standoff's (safely elevated)
-        # z - so horizontal centering happens first, at a height well
-        # clear of the object, and the final descent is a pure vertical
-        # drop straight down onto the already-centred position. This
-        # decouples "get over the object" from "go down onto it" instead
-        # of doing both at once along a diagonal.
-        hover_T_base = grasp_T_base.copy()
-        hover_T_base[2, 3] = standoff_T_base[2, 3]
-        hover_pose_msg = grasp_transform.matrix_to_pose(hover_T_base)
-        grasp_pose_msg = grasp_transform.matrix_to_pose(grasp_T_base)
-        cart = self._compute_cartesian_path(
-            group_name, eef_link, [hover_pose_msg, grasp_pose_msg])
-        if cart is None or cart.fraction < 1.0:
-            frac = None if cart is None else cart.fraction
-            self._fail_log(
-                f"Cartesian approach incomplete (fraction={frac}) - aborting. "
-                "This is already after refining max_step down to "
-                "cartesian_min_step, so it is not a discretisation problem: "
-                "a fraction well below 1.0 (rather than exactly 0.0 from a "
-                "service failure) means IK could not solve an increment even "
-                "at the finest step - the hover-then-descend approach "
-                "genuinely leaves the reachable workspace or passes near a "
-                "singularity for this grasp pose. Pick a different grasp "
-                "candidate."
+        # VERIFY WE ACTUALLY ARRIVED. MoveIt reporting SUCCESS is not
+        # evidence that the arm is at the pose: a run measured 62 mm of
+        # residual error in x after a "successful" approach, which is why
+        # the gripper kept
+        # closing on air next to a correctly located object. Comparing the
+        # commanded pose against live TF in the same breath removes the
+        # guesswork - and the operator timing problem of reading tf2_echo
+        # by hand afterwards.
+        try:
+            _now = self._tf_buffer.lookup_transform(
+                "fr3_link0", eef_link, rclpy.time.Time())
+            _a = np.array([_now.transform.translation.x,
+                           _now.transform.translation.y,
+                           _now.transform.translation.z])
+            _err = _a - grasp_T_base[:3, 3]
+            _mag = float(np.linalg.norm(_err)) * 1000.0
+            self.get_logger().info(
+                f"ARRIVAL CHECK: commanded {np.round(grasp_T_base[:3, 3], 4)}, "
+                f"actual {np.round(_a, 4)}, error "
+                f"[{_err[0] * 1000:+.1f} {_err[1] * 1000:+.1f} "
+                f"{_err[2] * 1000:+.1f}] mm (|{_mag:.1f}| mm)"
             )
-            return False
-        if self._execute_trajectory(cart.solution):
-            # VERIFY WE ACTUALLY ARRIVED. MoveIt reporting SUCCESS is not
-            # evidence that the arm is at the pose: a run measured 62 mm of
-            # residual error in x after a "successful" approach, which is
-            # why the gripper kept closing on air next to a correctly
-            # located object. Comparing the commanded pose against live TF
-            # in the same breath removes the guesswork - and the operator
-            # timing problem of reading tf2_echo by hand afterwards.
-            try:
-                _now = self._tf_buffer.lookup_transform(
-                    "fr3_link0", eef_link, rclpy.time.Time())
-                _a = np.array([_now.transform.translation.x,
-                               _now.transform.translation.y,
-                               _now.transform.translation.z])
-                _err = _a - grasp_T_base[:3, 3]
-                _mag = float(np.linalg.norm(_err)) * 1000.0
-                self.get_logger().info(
-                    f"ARRIVAL CHECK: commanded {np.round(grasp_T_base[:3, 3], 4)}, "
-                    f"actual {np.round(_a, 4)}, error "
-                    f"[{_err[0] * 1000:+.1f} {_err[1] * 1000:+.1f} "
-                    f"{_err[2] * 1000:+.1f}] mm (|{_mag:.1f}| mm)"
+            if _mag > 15.0:
+                self.get_logger().error(
+                    f"Arm is {_mag:.0f} mm from the commanded grasp pose "
+                    "after a 'successful' approach. The gripper will close "
+                    "on empty space. This is an EXECUTION fault, not a "
+                    "perception or grasp-selection fault."
                 )
-                if _mag > 15.0:
-                    self.get_logger().error(
-                        f"Arm is {_mag:.0f} mm from the commanded grasp pose "
-                        "after a 'successful' approach. The gripper will close "
-                        "on empty space. This is an EXECUTION fault, not a "
-                        "perception or grasp-selection fault."
-                    )
-            except Exception as exc:  # noqa: BLE001 - diagnostics only
-                self.get_logger().warn(f"Arrival check skipped: {exc}")
-        else:
-            self._fail_log("Cartesian approach execution failed - aborting")
-            return False
+        except Exception as exc:  # noqa: BLE001 - diagnostics only
+            self.get_logger().warn(f"Arrival check skipped: {exc}")
 
         # Step 3: close the gripper. One retry after re-homing, since a
         # failed Grasp is exactly what leaves the driver unresponsive for
@@ -1126,6 +1813,44 @@ class PragmabotBridge(Node):
             ):
                 self._fail_log("Gripper grasp failed after retry - aborting retreat")
                 return False
+
+        # VERIFY THE GRASP ACTUALLY HOLDS SOMETHING (measured 2026-09-16,
+        # real banana pick: Grasp reported success, the pick sequence
+        # "completed", but the banana was still on the table). See
+        # _current_gripper_width() - franka_msgs/Grasp's own success flag
+        # uses a deliberately generous outer epsilon (this file's own
+        # _grasp() docstring), so a barely-touching, insecure close can
+        # report success exactly like a real grasp does. A brief poll for
+        # a fresh joint_states reading, then compare against
+        # min_gripper_width: closed narrower than that with nothing
+        # between the fingers means empty air, not a grip that will
+        # survive Step 4's lift. Same "don't trust a reported SUCCESS,
+        # measure it" philosophy as the ARRIVAL CHECK above, applied to
+        # the gripper instead of the arm. A stale/missing reading (None)
+        # is NOT treated as failure - only a confirmed too-narrow width
+        # aborts, so a slow/absent joint_states publisher never blocks a
+        # pick that would otherwise have worked.
+        _settle_end = time.monotonic() + 0.3
+        _held_width = None
+        while time.monotonic() < _settle_end:
+            _held_width = self._current_gripper_width()
+            if _held_width is not None:
+                break
+            time.sleep(0.02)
+        _min_w = float(self.get_parameter("min_gripper_width").value)
+        if _held_width is not None:
+            self.get_logger().info(
+                f"Measured finger separation after grasp: {_held_width * 1000:.1f} mm "
+                f"(commanded width {gripper_width * 1000:.1f} mm)"
+            )
+        if _held_width is not None and _held_width < _min_w:
+            self._fail_log(
+                f"Grasp reported success but the fingers are only "
+                f"{_held_width * 1000:.1f} mm apart (< {_min_w * 1000:.0f} mm) - "
+                "nothing is actually held. Aborting before the lift instead "
+                "of reporting a false success."
+            )
+            return False
 
         # Step 4: straight-line lift along fr3_link0's own +Z (not the
         # grasp's own -Z) - less likely to re-collide with the table than
@@ -2045,6 +2770,130 @@ class PragmabotBridge(Node):
                     "and is the ZED wrapper's robot_state_publisher up?)"
                 )
 
+    def _broadcast_object_frame(
+        self, T_base: np.ndarray, parent_frame: str = "fr3_link0",
+        child_frame: str = "grasp_object"
+    ) -> None:
+        """Publish an object's coordinate frame (see
+        grasp_transform.object_frame_T_base) both to TF (relative to
+        `parent_frame`) and as a MarkerArray of three axis arrows on
+        `grasp_object_markers` -- the same pose both ways, so what you see
+        is exactly what filtered the grasp candidates, not a separate
+        visualization guess.
+
+        TF alone (rviz's built-in TF display) needs you to already know
+        the frame name and gives fixed-size, unlabelled axes. The
+        MarkerArray shows up directly in the topic list under
+        Add -> By topic, is scaled to something visible next to a small
+        object, and colour-codes which axis is which (X red, Y green, Z
+        blue, matching rviz's own TF axis convention) -- see the
+        step-by-step in the module docstring / chat for how to add it.
+        """
+        stamp = self.get_clock().now().to_msg()
+        pose = grasp_transform.matrix_to_pose(T_base)
+
+        # Terminal-visible readout, independent of rviz being open/
+        # configured correctly at all - origin is where the 3 arrows will
+        # be centred, columns 0/1/2 are the X(red)/Y(green)/Z(blue) axis
+        # directions you'd see rviz draw, all in `parent_frame`.
+        self.get_logger().info(
+            f"object frame ({parent_frame} <- {child_frame}), origin="
+            f"{np.round(T_base[:3, 3], 4).tolist()}:\n{np.round(T_base, 4)}"
+        )
+
+        tf_msg = TransformStamped()
+        tf_msg.header.stamp = stamp
+        tf_msg.header.frame_id = parent_frame
+        tf_msg.child_frame_id = child_frame
+        tf_msg.transform.translation.x = pose.position.x
+        tf_msg.transform.translation.y = pose.position.y
+        tf_msg.transform.translation.z = pose.position.z
+        tf_msg.transform.rotation = pose.orientation
+        self._object_tf_broadcaster.sendTransform(tf_msg)
+
+        markers = grasp_transform.object_frame_markers(T_base, parent_frame, stamp=stamp)
+        self._object_marker_pub.publish(markers)
+
+    def _broadcast_grasp_markers(
+        self, grasps_T_base: np.ndarray, selected_index: int,
+        candidate_indices, gripper_width: float, frame_id: str = "fr3_link0"
+    ) -> None:
+        """Publish the grasp candidates actually under consideration THIS
+        pick, in `frame_id` - so they can be checked in rviz against the
+        real robot model and the live ZED point cloud, not just read as a
+        matrix in the terminal or viewed disconnected from the robot in
+        the offline viser tool (visualize_live_grasps.py).
+
+        `candidate_indices` (the ranked/viable pool, already gated by
+        tilt/cross-axis/width - typically a few to a few dozen) are drawn
+        as thin orange ARROWs along their approach axis only (GraspGen
+        convention: local +Z) - cheap context, not meant to be inspected
+        one by one. `selected_index` - the pose about to actually be
+        commanded - gets a full gripper icon instead (LINE_LIST: two
+        fingers + the knuckle bar joining them, sized to the real
+        `gripper_width`), built directly from `grasps_T_base[selected_index]`
+        with no intermediate approximation, so its position and opening
+        in rviz is exactly what MoveIt will be asked to reach.
+        """
+        stamp = self.get_clock().now().to_msg()
+        markers = MarkerArray()
+        depth = 0.10527314  # franka_panda.yaml fingertip-contact depth, same constant used throughout
+
+        idx = 0
+        for cand in candidate_indices:
+            T = grasps_T_base[int(cand)]
+            origin = T[:3, 3]
+            tip = origin + depth * T[:3, 2]
+            m = Marker()
+            m.header.frame_id = frame_id
+            m.header.stamp = stamp
+            m.ns = "grasp_candidates"
+            m.id = idx
+            idx += 1
+            m.type = Marker.ARROW
+            m.action = Marker.ADD
+            p0, p1 = Point(), Point()
+            p0.x, p0.y, p0.z = float(origin[0]), float(origin[1]), float(origin[2])
+            p1.x, p1.y, p1.z = float(tip[0]), float(tip[1]), float(tip[2])
+            m.points = [p0, p1]
+            m.scale.x = 0.002  # shaft diameter
+            m.scale.y = 0.004  # head diameter
+            m.scale.z = 0.0
+            # Deliberately NOT red/green/blue - object_frame_markers already
+            # uses that exact scheme for X/Y/Z, and drawing both marker
+            # sets together (as a real rviz session did) made them
+            # visually indistinguishable, reported as a 45 deg mismatch
+            # that was actually just a marker mixed in from the wrong set.
+            m.color = ColorRGBA(r=1.0, g=0.6, b=0.0, a=0.5)  # orange
+            markers.markers.append(m)
+
+        T = grasps_T_base[int(selected_index)]
+        R_ = T[:3, :3]
+        t = T[:3, 3]
+        half = max(float(gripper_width), 0.01) / 2.0
+        local_pts = [
+            (-half, 0.0, 0.0), (-half, 0.0, depth),   # left finger
+            (half, 0.0, 0.0), (half, 0.0, depth),     # right finger
+            (-half, 0.0, 0.0), (half, 0.0, 0.0),      # knuckle bar
+        ]
+        m = Marker()
+        m.header.frame_id = frame_id
+        m.header.stamp = stamp
+        m.ns = "selected_grasp"
+        m.id = 0
+        m.type = Marker.LINE_LIST
+        m.action = Marker.ADD
+        for lx, ly, lz in local_pts:
+            wp = t + R_ @ np.array([lx, ly, lz])
+            pt = Point()
+            pt.x, pt.y, pt.z = float(wp[0]), float(wp[1]), float(wp[2])
+            m.points.append(pt)
+        m.scale.x = 0.004  # line width
+        m.color = ColorRGBA(r=1.0, g=0.0, b=1.0, a=1.0)  # magenta - same reason, not blue
+        markers.markers.append(m)
+
+        self._grasp_candidates_pub.publish(markers)
+
     def _pose_goal_constraints(
         self, link_name: str, pose: Pose, pos_tol: float = 0.01, ori_tol: float = 0.02
     ) -> Constraints:
@@ -2097,10 +2946,11 @@ class PragmabotBridge(Node):
         result = self._send_goal_blocking(self._move_client, goal, "MoveGroup")
         if result is None:
             return False
-        ok = result.result.error_code.val == MoveItErrorCodes.SUCCESS
+        code = result.result.error_code.val
+        ok = code == MoveItErrorCodes.SUCCESS
         if not ok:
             self.get_logger().error(
-                f"MoveGroup failed, error_code={result.result.error_code.val}"
+                f"MoveGroup failed, error_code={code} ({_moveit_error_name(code)})"
             )
         return ok
 
@@ -2285,7 +3135,22 @@ class PragmabotBridge(Node):
         result = self._send_goal_blocking(self._execute_client, goal, "ExecuteTrajectory")
         if result is None:
             return False
-        return result.result.error_code.val == MoveItErrorCodes.SUCCESS
+        code = result.result.error_code.val
+        ok = code == MoveItErrorCodes.SUCCESS
+        if not ok:
+            # THE GAP THIS CLOSES (2026-09-16, real banana pick): this used
+            # to return False here with no log line of its own, so a
+            # genuine robot-side execution fault (collision/reflex,
+            # CONTROL_FAILED) and every other non-SUCCESS code were
+            # indistinguishable from each other in the log - the caller's
+            # generic "Cartesian approach execution failed" was all there
+            # was to go on. Now says exactly which MoveItErrorCodes value
+            # came back.
+            self.get_logger().error(
+                f"ExecuteTrajectory failed, error_code={code} "
+                f"({_moveit_error_name(code)})"
+            )
+        return ok
 
     def _grasp(self, width: float, speed: float, force: float, epsilon: float) -> bool:
         """Close on an object of roughly `width` metres.
@@ -2324,6 +3189,100 @@ class PragmabotBridge(Node):
             return False
         return True
 
+    def _current_gripper_width(self, max_age_sec: float = 1.0):
+        """Real measured finger separation right now, from
+        /franka_gripper/joint_states (summed finger joint positions) - not
+        the commanded width, not the Grasp action's own success flag.
+
+        Returns None if no message has arrived yet or the latest one is
+        older than `max_age_sec` (stale - do not trust it for a check that
+        is about to gate a retry/abort decision). Callers should treat
+        None as "cannot verify," not as "grasp failed" - see the caller in
+        execute_pick for how that ambiguity is handled.
+        """
+        msg = self._gripper_joint_state
+        if msg is None:
+            return None
+        stamp = msg.header.stamp
+        age = self.get_clock().now() - rclpy.time.Time.from_msg(stamp)
+        if age.nanoseconds / 1e9 > max_age_sec:
+            return None
+        if len(msg.position) < 2:
+            return None
+        return float(msg.position[0] + msg.position[1])
+
+    def _current_arm_joint_positions(self, max_age_sec: float = 1.0):
+        """Real measured arm joint positions (fr3_joint1..7) right now, from
+        `arm_joint_states_topic` - separate from the gripper's own
+        _current_gripper_width() subscription above.
+
+        Returns a name->position dict, or None if no message has arrived
+        yet, the latest one is stale, or it doesn't carry every joint
+        `self._limits` expects (e.g. wrong topic, or a message that only
+        carries the gripper's fingers). Callers must treat None as "cannot
+        rank candidates by motion distance," not as an error - see the
+        retry-loop caller in execute_pick, which falls back to plain
+        confidence order when this is unavailable.
+        """
+        msg = self._arm_joint_state
+        if msg is None:
+            return None
+        stamp = msg.header.stamp
+        age = self.get_clock().now() - rclpy.time.Time.from_msg(stamp)
+        if age.nanoseconds / 1e9 > max_age_sec:
+            return None
+        wanted = set(self._limits.names())
+        out = {n: p for n, p in zip(msg.name, msg.position) if n in wanted}
+        if len(out) < len(wanted):
+            return None
+        return out
+
+    def _solve_ik(self, group_name: str, link_name: str, pose: Pose,
+                  timeout_sec: float = 2.0):
+        """One-shot /compute_ik call - ESTIMATION ONLY, never used to command
+        motion. Used solely to rank grasp candidates by how far their
+        standoff pose is from the arm's actual current configuration (see
+        grasp_transform.config_distance() and the retry loop in
+        execute_pick) before the real Cartesian/MoveGroup retry loop tries
+        them for real.
+
+        Leaves `ik_request.robot_state` at its default (empty) so MoveIt
+        seeds the solve from whatever the planning scene monitor already
+        has - i.e. the arm's real current state - which is exactly the
+        seed a ranking-by-distance-from-here needs.
+
+        `avoid_collisions=False`: this is a distance ESTIMATE, not a plan
+        that will be executed - the real Cartesian/MoveGroup calls in the
+        retry loop still do full collision-aware planning regardless of
+        what this returns.
+
+        Returns a name->position dict, or None if the service is
+        unavailable, times out, or IK fails for this pose (a candidate
+        with no IK solution here is exactly the case the existing retry
+        loop already falls through on, just discovered slightly earlier).
+        """
+        if not self._ik_client.wait_for_service(timeout_sec=2.0):
+            return None
+
+        request = GetPositionIK.Request()
+        request.ik_request.group_name = group_name
+        request.ik_request.ik_link_name = link_name
+        request.ik_request.pose_stamped.header.frame_id = "fr3_link0"
+        request.ik_request.pose_stamped.pose = pose
+        request.ik_request.timeout.sec = int(timeout_sec)
+        request.ik_request.timeout.nanosec = int(
+            (timeout_sec - int(timeout_sec)) * 1e9)
+        request.ik_request.avoid_collisions = False
+
+        future = self._ik_client.call_async(request)
+        self._spin_until_done(future, timeout_sec=timeout_sec + 1.0)
+        result = future.result()
+        if result is None or result.error_code.val != MoveItErrorCodes.SUCCESS:
+            return None
+
+        state = result.solution.joint_state
+        wanted = set(self._limits.names())
+        return {n: p for n, p in zip(state.name, state.position) if n in wanted}
 
     def _add_table_collision(self) -> bool:
         """Push a tabletop box into MoveIt's planning scene, once per run.
