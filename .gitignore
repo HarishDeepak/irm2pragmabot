@@ -41,3 +41,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 *.swp
+
+# ---- nested repos (cloned locally, not vendored into this repo) ----
+external/
