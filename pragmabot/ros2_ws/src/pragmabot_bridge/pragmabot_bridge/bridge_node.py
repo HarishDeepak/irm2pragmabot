@@ -964,16 +964,36 @@ class PragmabotBridge(Node):
         self.get_logger().info(f"standoff pose (fr3_link0):\n{standoff_T_base}")
         self.get_logger().info(f"grasp pose (fr3_link0):\n{grasp_T_base}")
 
-        # Step 1: reach the pre-grasp standoff. Try a straight-line
-        # Cartesian path first - deterministic, and already collision- and
-        # jump-guarded by _compute_cartesian_path/_execute_trajectory, the
-        # same machinery Steps 2 and 4 below use. Fall back to free-space
-        # OMPL planning (_move_to_pose) only if the straight line itself
-        # isn't reachable. An unconstrained OMPL plan from wherever the arm
-        # currently is has no reason to prefer a short or direct path, and
-        # with no collision scene in MoveIt yet, nothing else biases it
-        # toward one either - this is the "weird trajectory" symptom seen
-        # in the 2026-08-24 evening run.
+        # Steps 1+2: reach the pre-grasp standoff, then approach into the
+        # grasp pose via a HOVER waypoint, not a single straight line from
+        # standoff - both attempted per-candidate, in the SAME retry loop.
+        #
+        # WHY THEY'RE IN ONE LOOP (not two separate ones). Originally the
+        # standoff reach (this step) retried across `attempts` but the
+        # hover-then-descend approach below did not: it only ever tried the
+        # ONE candidate whichever standoff attempt happened to reach. A
+        # standoff being reachable says nothing about the final approach
+        # also being reachable - measured 2026-09-23, a real 'green cube'
+        # pick reached standoff fine on the FIRST candidate both times, then
+        # the hover+grasp Cartesian path failed at fraction 0.97-0.99 (a
+        # near-singular joint flip on the final descent) and the whole pick
+        # aborted outright, even though ~48 other tilt/width-legal
+        # candidates were sitting right there unused. Folding both stages
+        # into one loop means a candidate whose STANDOFF is reachable but
+        # whose FINAL APPROACH isn't gets skipped in favour of the next
+        # candidate, instead of failing the whole pick.
+        #
+        # Standoff: try a straight-line Cartesian path first - deterministic,
+        # and already collision- and jump-guarded by
+        # _compute_cartesian_path/_execute_trajectory, the same machinery
+        # Steps 2 and 4 use. Fall back to free-space OMPL planning
+        # (_move_to_pose) only if the straight line itself isn't reachable.
+        # An unconstrained OMPL plan from wherever the arm currently is has
+        # no reason to prefer a short or direct path, and with no collision
+        # scene in MoveIt yet, nothing else biases it toward one either -
+        # this is the "weird trajectory" symptom (unnecessary joint
+        # rotation, including the wrist) seen in the 2026-08-24 evening run.
+        #
         # RETRY ACROSS CANDIDATES. A single grasp pose can be perfectly good
         # yet have no IK solution for this arm (OMPL reports "Unable to
         # sample any valid states for goal tree"), which is a property of
@@ -983,8 +1003,34 @@ class PragmabotBridge(Node):
         # pipeline look intermittent. Only PLANNING failures fall through
         # to the next candidate; a failure while the arm is actually
         # moving still aborts, since the arm is then somewhere unknown.
+        #
+        # Hover waypoint (measured 2026-08-26, real cube, hit its top
+        # surface twice in a row). standoff_pose() backs the standoff off
+        # along the grasp's OWN approach axis (grasp_transform.
+        # standoff_pose) - for a tilted grasp that axis has a horizontal
+        # component, so standoff and grasp differ in x/y AND z at once. A
+        # single straight line between them therefore descends and slides
+        # sideways simultaneously: one real trial measured (dx=+15mm,
+        # dy=-27mm, dz=-116mm) over a 120mm move (matches the reported 15
+        # deg tilt: sin(15)*120mm = 31mm of sideways drift). The object's
+        # own footprint was only ~40-50mm across, so for part of that
+        # descent the gripper was still sliding into its final x/y position
+        # while already BELOW the object's top-surface height - a geometric
+        # collision with the cube's top, not a perception or calibration
+        # error. This gets WORSE at higher tilt (more sideways drift per mm
+        # of descent), which is exactly the direction things got worse when
+        # testing steeper tilts. THE FIX: insert a waypoint directly above
+        # the grasp target - same x/y as the grasp, but at the standoff's
+        # (safely elevated) z - so horizontal centering happens first, at a
+        # height well clear of the object, and the final descent is a pure
+        # vertical drop straight down onto the already-centred position.
+        # This decouples "get over the object" from "go down onto it"
+        # instead of doing both at once along a diagonal.
         attempts = viable if viable else [grasp_index]
         reached = False
+        hover_pose_msg = None
+        grasp_pose_msg = None
+        cart = None
         for attempt_n, cand in enumerate(attempts):
             if attempt_n:
                 grasp_index = int(cand)
@@ -992,31 +1038,55 @@ class PragmabotBridge(Node):
                 grasp_T_base = grasps_T_base[grasp_index]
                 standoff_T_base = grasp_transform.standoff_pose(grasp_T_base, standoff_m)
                 self.get_logger().warn(
-                    f"Standoff unreachable - trying candidate {attempt_n + 1}"
-                    f"/{len(attempts)} (grasp {grasp_index})"
+                    f"Trying candidate {attempt_n + 1}/{len(attempts)} "
+                    f"(grasp {grasp_index})"
                 )
                 self.get_logger().info(f"standoff pose (fr3_link0):\n{standoff_T_base}")
 
             standoff_pose_msg = grasp_transform.matrix_to_pose(standoff_T_base)
-            cart = self._compute_cartesian_path(group_name, eef_link, [standoff_pose_msg])
-            if cart is not None and cart.fraction >= 1.0:
-                if not self._execute_trajectory(cart.solution):
+            at_standoff = False
+            standoff_cart = self._compute_cartesian_path(
+                group_name, eef_link, [standoff_pose_msg])
+            if standoff_cart is not None and standoff_cart.fraction >= 1.0:
+                if not self._execute_trajectory(standoff_cart.solution):
                     self._fail_log("Cartesian path to standoff pose failed to execute - aborting")
                     return False
-                reached = True
-                break
-            if self._move_to_pose(group_name, eef_link, standoff_pose_msg):
+                at_standoff = True
+            elif self._move_to_pose(group_name, eef_link, standoff_pose_msg):
+                at_standoff = True
+
+            if not at_standoff:
+                continue  # standoff itself unreachable - try next candidate
+
+            hover_T_base = grasp_T_base.copy()
+            hover_T_base[2, 3] = standoff_T_base[2, 3]
+            hover_pose_msg = grasp_transform.matrix_to_pose(hover_T_base)
+            grasp_pose_msg = grasp_transform.matrix_to_pose(grasp_T_base)
+            cart = self._compute_cartesian_path(
+                group_name, eef_link, [hover_pose_msg, grasp_pose_msg])
+            if cart is not None and cart.fraction >= 1.0:
                 reached = True
                 break
 
+            frac = None if cart is None else cart.fraction
+            self.get_logger().warn(
+                f"Standoff for candidate {attempt_n + 1}/{len(attempts)} "
+                f"(grasp {grasp_index}) was reachable but the hover-then-"
+                f"descend approach was not (fraction={frac}) - the arm is "
+                "safely parked at standoff; trying the next candidate "
+                "rather than aborting the pick"
+            )
+
         if not reached:
             self._fail_log(
-                f"Failed to reach the standoff pose for any of {len(attempts)} "
-                "grasp candidates - every near-vertical, correctly-sized grasp "
-                "for this object is outside the arm's reachable workspace from "
+                f"Failed to reach standoff AND complete the hover-then-"
+                f"descend approach for any of {len(attempts)} grasp "
+                "candidates - every near-vertical, correctly-sized grasp "
+                "for this object is either outside the arm's reachable "
+                "workspace or forces a near-singular final approach from "
                 "its current configuration. Move the object closer to the "
-                "centre of the table, or move the arm to a different starting "
-                "pose, before retrying."
+                "centre of the table, or move the arm to a different "
+                "starting pose, before retrying."
             )
             return False
 
@@ -1033,53 +1103,6 @@ class PragmabotBridge(Node):
             except ValueError as exc:
                 self.get_logger().warn(f"Could not re-estimate gripper width: {exc}")
 
-        # Step 2: approach into the grasp pose via a HOVER waypoint, not a
-        # single straight line from standoff.
-        #
-        # WHY (measured 2026-08-26, real cube, hit its top surface twice in
-        # a row). standoff_pose() backs the standoff off along the grasp's
-        # OWN approach axis (grasp_transform.standoff_pose) - for a tilted
-        # grasp that axis has a horizontal component, so standoff and grasp
-        # differ in x/y AND z at once. A single straight line between them
-        # therefore descends and slides sideways simultaneously: one real
-        # trial measured (dx=+15mm, dy=-27mm, dz=-116mm) over a 120mm move
-        # (matches the reported 15 deg tilt: sin(15)*120mm = 31mm of
-        # sideways drift). The object's own footprint was only ~40-50mm
-        # across, so for part of that descent the gripper was still
-        # sliding into its final x/y position while already BELOW the
-        # object's top-surface height - a geometric collision with the
-        # cube's top, not a perception or calibration error. This gets
-        # WORSE at higher tilt (more sideways drift per mm of descent),
-        # which is exactly the direction things got worse when testing
-        # steeper tilts.
-        #
-        # THE FIX. Insert a waypoint directly above the grasp target -
-        # same x/y as the grasp, but at the standoff's (safely elevated)
-        # z - so horizontal centering happens first, at a height well
-        # clear of the object, and the final descent is a pure vertical
-        # drop straight down onto the already-centred position. This
-        # decouples "get over the object" from "go down onto it" instead
-        # of doing both at once along a diagonal.
-        hover_T_base = grasp_T_base.copy()
-        hover_T_base[2, 3] = standoff_T_base[2, 3]
-        hover_pose_msg = grasp_transform.matrix_to_pose(hover_T_base)
-        grasp_pose_msg = grasp_transform.matrix_to_pose(grasp_T_base)
-        cart = self._compute_cartesian_path(
-            group_name, eef_link, [hover_pose_msg, grasp_pose_msg])
-        if cart is None or cart.fraction < 1.0:
-            frac = None if cart is None else cart.fraction
-            self._fail_log(
-                f"Cartesian approach incomplete (fraction={frac}) - aborting. "
-                "This is already after refining max_step down to "
-                "cartesian_min_step, so it is not a discretisation problem: "
-                "a fraction well below 1.0 (rather than exactly 0.0 from a "
-                "service failure) means IK could not solve an increment even "
-                "at the finest step - the hover-then-descend approach "
-                "genuinely leaves the reachable workspace or passes near a "
-                "singularity for this grasp pose. Pick a different grasp "
-                "candidate."
-            )
-            return False
         if self._execute_trajectory(cart.solution):
             # VERIFY WE ACTUALLY ARRIVED. MoveIt reporting SUCCESS is not
             # evidence that the arm is at the pose: a run measured 62 mm of
