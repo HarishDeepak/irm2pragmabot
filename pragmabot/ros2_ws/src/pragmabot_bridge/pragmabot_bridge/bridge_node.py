@@ -106,12 +106,13 @@ from moveit_msgs.msg import (
     PlanningScene,
     PositionConstraint,
 )
-from moveit_msgs.srv import ApplyPlanningScene, GetCartesianPath
+from moveit_msgs.srv import ApplyPlanningScene, GetCartesianPath, GetPositionIK
 from pragmabot_interfaces.action import ExecuteSkill
 from rclpy.action import ActionClient, ActionServer
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import Header
 from tf2_ros import Buffer, TransformListener
@@ -134,6 +135,15 @@ class PragmabotBridge(Node):
         self._gripper_move_client = ActionClient(self, Move, "/franka_gripper/move")
         self._cartesian_client = self.create_client(
             GetCartesianPath, "/compute_cartesian_path"
+        )
+        # Used only to SCORE grasp candidates before committing to motion
+        # (see the joint-motion/limit prefilter in execute_pick) - never
+        # for execution itself, which stays on _compute_cartesian_path and
+        # _move_to_pose with their own collision/jump guards.
+        self._ik_client = self.create_client(GetPositionIK, "/compute_ik")
+        self._latest_joint_state: JointState | None = None
+        self._joint_state_sub = self.create_subscription(
+            JointState, "/joint_states", self._on_joint_state, 10
         )
 
         self._tf_buffer = Buffer()
@@ -249,6 +259,29 @@ class PragmabotBridge(Node):
         # interpolator (moveit2 #2404), so the guard has to be applied
         # here instead of trusted to the service.
         self.declare_parameter("max_joint_jump_rad", 0.5)
+
+        # --- joint-motion / limit-proximity candidate prefilter -----------
+        # WHY THIS EXISTS. kinematics.yaml (franka_fr3_moveit_config) uses
+        # lma_kinematics_plugin - a single-solution numeric IK solver with
+        # NO secondary objective. The FR3 is 7-DoF against a 6-DoF pose
+        # goal, so a whole null space of joint configs (elbow/wrist swing)
+        # reaches the identical gripper pose, and LMA has nothing telling
+        # it to prefer the one closest to where the arm already is or
+        # furthest from a limit - it just returns whatever the
+        # Levenberg-Marquardt descent converges to from the seed, which can
+        # be an unnecessary near-full rotation of joint 7 (or any other
+        # joint) even when a much smaller move reaches the same pose. This
+        # runs /compute_ik once per grasp candidate's standoff pose BEFORE
+        # any motion is attempted, purely to reject candidates whose
+        # standoff config is a large joint-space jump from the live state
+        # or crowds a limit - grasp_transform.config_distance/
+        # joint_limit_margin already existed for exactly this but were
+        # never wired in until now. Real fix for the underlying redundancy
+        # is a null-space-aware IK plugin (pick_ik); this is a same-solver
+        # mitigation that needs no MoveIt reconfigure.
+        # 0.0 disables the corresponding check.
+        self.declare_parameter("max_candidate_config_distance_rad", 2.5)
+        self.declare_parameter("min_candidate_limit_margin_rad", 0.05)
 
         # --- action call timeouts ----------------------------------------
         # Bounds every wait in _send_goal_blocking. Without these a crashed
@@ -1027,21 +1060,97 @@ class PragmabotBridge(Node):
         # This decouples "get over the object" from "go down onto it"
         # instead of doing both at once along a diagonal.
         attempts = viable if viable else [grasp_index]
+
+        # JOINT-MOTION / LIMIT-PROXIMITY PREFILTER. See the
+        # max_candidate_config_distance_rad/min_candidate_limit_margin_rad
+        # declare_parameter comments for why this exists (lma_kinematics_
+        # plugin has no null-space secondary objective). Runs /compute_ik
+        # for each candidate's STANDOFF pose only (cheap - `attempts` is
+        # capped by max_grasp_attempts, a handful of candidates, not
+        # hundreds) and drops any whose solution is a large joint-space
+        # jump from the live state or crowds a limit, before the retry loop
+        # below ever tries to move there. Fails OPEN: if the live joint
+        # state or /compute_ik isn't available, or every candidate gets
+        # filtered out, this falls back to the unfiltered list rather than
+        # blocking a pick on a diagnostic check.
+        max_dist = float(self.get_parameter("max_candidate_config_distance_rad").value)
+        min_margin = float(self.get_parameter("min_candidate_limit_margin_rad").value)
+        if (max_dist > 0.0 or min_margin > 0.0) and self._latest_joint_state is not None:
+            current_by_name = dict(zip(
+                self._latest_joint_state.name, self._latest_joint_state.position))
+            filtered = []
+            for cand in attempts:
+                cand_standoff_T = grasp_transform.standoff_pose(
+                    grasps_T_base[int(cand)], standoff_m)
+                ik = self._ik_joint_config(
+                    group_name, eef_link, grasp_transform.matrix_to_pose(cand_standoff_T))
+                if ik is None:
+                    filtered.append(cand)  # couldn't check - don't block on it
+                    continue
+                names, positions = ik
+                cand_by_name = dict(zip(names, positions))
+                common = [n for n in names if n in current_by_name]
+                if common and max_dist > 0.0:
+                    dist = grasp_transform.config_distance(
+                        [cand_by_name[n] for n in common],
+                        [current_by_name[n] for n in common],
+                    )
+                    if dist > max_dist:
+                        self.get_logger().warn(
+                            f"Candidate {cand}: standoff IK needs "
+                            f"{np.degrees(dist):.0f} deg of joint travel "
+                            f"(limit {np.degrees(max_dist):.0f} deg) - "
+                            "skipping to avoid an unnecessarily large "
+                            "joint move"
+                        )
+                        continue
+                if min_margin > 0.0:
+                    margin, who = grasp_transform.joint_limit_margin(
+                        names, positions, self._limits.bounds())
+                    if who and margin < min_margin:
+                        self.get_logger().warn(
+                            f"Candidate {cand}: standoff IK leaves only "
+                            f"{np.degrees(margin):.1f} deg margin on {who} "
+                            f"(limit {np.degrees(min_margin):.1f} deg) - "
+                            "skipping"
+                        )
+                        continue
+                filtered.append(cand)
+            if filtered:
+                if len(filtered) < len(attempts):
+                    self.get_logger().info(
+                        f"Joint-motion/limit prefilter kept {len(filtered)}/"
+                        f"{len(attempts)} candidate(s)"
+                    )
+                attempts = filtered
+            else:
+                self.get_logger().warn(
+                    "Joint-motion/limit prefilter rejected every candidate "
+                    "- falling back to the unfiltered list rather than "
+                    "aborting the pick"
+                )
+
         reached = False
         hover_pose_msg = None
         grasp_pose_msg = None
         cart = None
         for attempt_n, cand in enumerate(attempts):
+            # Recompute from `cand` on EVERY iteration, including the
+            # first: the joint-motion/limit prefilter above may have
+            # reordered or dropped the original grasp_index, so
+            # attempts[0] is no longer guaranteed to be whatever
+            # grasp_index/grasp_T_base/standoff_T_base already hold from
+            # before this loop.
+            grasp_index = int(cand)
+            grasp_T_cam = grasps_T_cam[grasp_index]
+            grasp_T_base = grasps_T_base[grasp_index]
+            standoff_T_base = grasp_transform.standoff_pose(grasp_T_base, standoff_m)
             if attempt_n:
-                grasp_index = int(cand)
-                grasp_T_cam = grasps_T_cam[grasp_index]
-                grasp_T_base = grasps_T_base[grasp_index]
-                standoff_T_base = grasp_transform.standoff_pose(grasp_T_base, standoff_m)
                 self.get_logger().warn(
                     f"Trying candidate {attempt_n + 1}/{len(attempts)} "
                     f"(grasp {grasp_index})"
                 )
-                self.get_logger().info(f"standoff pose (fr3_link0):\n{standoff_T_base}")
+            self.get_logger().info(f"standoff pose (fr3_link0):\n{standoff_T_base}")
 
             standoff_pose_msg = grasp_transform.matrix_to_pose(standoff_T_base)
             at_standoff = False
@@ -2106,6 +2215,44 @@ class PragmabotBridge(Node):
         constraints.position_constraints.append(position_constraint)
         constraints.orientation_constraints.append(orientation_constraint)
         return constraints
+
+    def _on_joint_state(self, msg: JointState) -> None:
+        self._latest_joint_state = msg
+
+    def _ik_joint_config(self, group_name: str, link_name: str, pose: Pose,
+                          timeout_s: float = 0.5):
+        """Solve IK for `pose`, seeded from the live joint state, for
+        SCORING a candidate before any motion is attempted - never for
+        execution (that stays on _compute_cartesian_path/_move_to_pose and
+        their own guards). Returns (names, positions) from the solution,
+        or None if no live joint state has arrived yet, the service isn't
+        up, or the solve fails/times out - callers must treat None as
+        "couldn't check", not "candidate is bad".
+        """
+        if self._latest_joint_state is None:
+            return None
+        if not self._ik_client.service_is_ready():
+            if not self._ik_client.wait_for_service(timeout_sec=1.0):
+                return None
+
+        request = GetPositionIK.Request()
+        request.ik_request.group_name = group_name
+        request.ik_request.ik_link_name = link_name
+        request.ik_request.avoid_collisions = True
+        request.ik_request.robot_state.joint_state = self._latest_joint_state
+        request.ik_request.pose_stamped.header.frame_id = "fr3_link0"
+        request.ik_request.pose_stamped.header.stamp = self.get_clock().now().to_msg()
+        request.ik_request.pose_stamped.pose = pose
+        request.ik_request.timeout.sec = 0
+        request.ik_request.timeout.nanosec = int(timeout_s * 1e9)
+
+        future = self._ik_client.call_async(request)
+        self._spin_until_done(future, timeout_sec=timeout_s + 1.0)
+        result = future.result()
+        if result is None or result.error_code.val != MoveItErrorCodes.SUCCESS:
+            return None
+        js = result.solution.joint_state
+        return list(js.name), list(js.position)
 
     def _move_to_pose(self, group_name: str, link_name: str, pose: Pose) -> bool:
         goal = MoveGroup.Goal()
