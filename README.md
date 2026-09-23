@@ -22,20 +22,31 @@ Based on [leggedrobotics/pragmabot](https://github.com/leggedrobotics/pragmabot)
 irm2pragmabot/
 ├── pragmabot/                        planner, memory, calibration pipeline
 │   ├── pragmabot/                    the ROS package (VLM + STM/LTM/RAG)
+│   ├── ros2_ws/src/pragmabot_bridge/ *** the FR3 execution layer -- THE active copy ***
 │   ├── calibration/                  detect_object, mask_to_pointcloud, extrinsics
 │   ├── extracted/                    2 captured scenes -- TRACKED, work offline now
+│   ├── ARMIN.md                      running lab journal, most current day-to-day record
 │   └── bags/                         rosbag goes here (not in git, see below)
-├── ros2_ws/franka_ros2/              mounted into the Docker container
-│   ├── pragmabot_bridge/             *** the FR3 execution layer (671 lines) ***
-│   ├── pragmabot_interfaces/         action definitions (not yet generated)
-│   └── easy_handeye2/                hand-eye calibration (vendored, LGPL)
+├── ros2_ws/franka_ros2/              STALE mirror, do not edit -- see caveat below
 ├── GraspGen/                         6-DoF grasp synthesis (NVIDIA, non-commercial)
 ├── groundedsam/Grounded-SAM-2/       open-vocabulary segmentation
 ├── zed_ros2_ws/src/zed-ros2-wrapper/ ZED2 driver
-├── docs/                             analysis, reproduction plan, handoff
 ├── setup.sh                          downloads model checkpoints
 └── SETUP.md                          environment build guide
 ```
+
+> **Caveat, confirmed 2026-09-23 — three copies of `bridge_node.py` exist on a
+> lab machine, only one is live.** `pragmabot/ros2_ws/src/pragmabot_bridge/`
+> (git-tracked, this repo) is the one actually built and run by the Control
+> container — confirmed by log lines added there during a live debugging
+> session showing up in the real robot's console output. Two other copies are
+> stale leftovers from an earlier layout: this repo's own
+> `ros2_ws/franka_ros2/pragmabot_bridge/` (last touched 2026-08-24, far
+> smaller) and a completely separate, **not git-tracked** directory at
+> `~/ros2_ws/franka_ros2/pragmabot_bridge/` on the lab machine (also stale,
+> 2026-08-24). Edit only `pragmabot/ros2_ws/src/pragmabot_bridge/`; the other
+> two should probably be deleted once someone confirms nothing on the lab
+> machine still points at them, but that hasn't been verified/done yet.
 
 ## Where things run
 
@@ -194,24 +205,29 @@ More detail and every gotcha: `docs/00_MASTER_REFERENCE.md`.
 
 ## Documentation
 
+`docs/` (top-level) is empty — the file names below don't exist there; use
+these instead, which do:
+
 | File | What it covers |
 |---|---|
-| **`docs/05_HANDOFF.md`** | **Read first.** Current state, rules, verified findings, next action. |
-| `docs/00_MASTER_REFERENCE.md` | The paper *and* the system in depth — the lookup doc |
-| `docs/01_PAPER_ANALYSIS.md` | What "reproduced" must mean; what exists and what doesn't |
-| `docs/02_REPRODUCTION_PLAN.md` | Ordered steps, `[HOME]`/`[LAB]` tagged, with done-conditions |
-| `docs/04_ROS2_MIGRATION.md` | The ROS 1 → ROS 2 port plan |
-| `docs/paper-study/` | Paper summary, insights, method, Q&A, runnable demo |
+| **`pragmabot/CLAUDE.md`** | **Read first.** Verified facts, confirmed paths, hard rules, behavioral rules. Kept current, don't re-derive what's already here. |
+| `pragmabot/ARMIN.md` | Running lab journal — chronological, day-by-day findings, fixes, and open issues. The most current record of what actually happened on hardware. |
+| `pragmabot/RUNBOOK.md` | Full pipeline bring-up, in order, with a check after each step. |
+| `pragmabot/HANDOFF_2026-08-24_EVENING.md` | Point-in-time project-state snapshot. |
+| `pragmabot/LAB_README.md` | Raw scratch log of commands actually typed at the lab. |
+| `pragmabot/LAB_README_ARCHIVE.md` | Earlier, longer version of the lab notes, kept for calibration history. |
 
 ---
 
 ## Status
 
-**Works, verified on real data:** segmentation → point cloud → grasp synthesis → grasp math; hand-eye calibration performed in the lab.
+_(Last refreshed 2026-09-23, from `pragmabot/ARMIN.md` and a live debugging session — verify against it if this drifts again.)_
 
-**Written but never run on the robot:** `execute_pick()` in `pragmabot_bridge`.
+**Working, verified on real hardware:** the full perception → grasp → execution chain. `pick` + `place` (e.g. green cube onto a tray/bowl) ran reliably (~8+ clean runs, ~1mm arrival error) as of 2026-08-28. `push` (obstacle clearing) is also implemented and has run on hardware. The planner ⇄ executor connection exists and is live — `/pragmabot/execute_skill` dispatches VLM-chosen skills to the bridge. STM and LTM are both implemented, re-enabled, and exercised in real multi-step tasks (e.g. unstacking before picking).
 
-**Not started:** planner ⇄ executor connection, place/push, the memory experiments, and the two course extensions (local VLM, ontology-based memory).
+**Known open issues (2026-09-23):** a live debugging session traced repeated `Cartesian approach incomplete` failures to a stale `calib_correction_z` launch override (from before a same-day hand-eye recalibration) pushing the grasp-depth target too close to the table for `avoid_collisions` to clear — root-caused, fix identified, not yet confirmed on hardware. Also open: the wrist/backhand-yaw grasp gate, and multi-view point-cloud capture for non-boxy objects (cups, bowls) — see `ARMIN.md`.
+
+**Not started:** the two course extensions (local VLM acceleration, ontology-based memory).
 
 Most of the paper's claims are reproducible **without the robot** — `rosbag_replay: true` skips execution entirely, and the retrieval ablation executes nothing at all.
 

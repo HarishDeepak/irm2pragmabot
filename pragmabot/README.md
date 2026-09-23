@@ -1,22 +1,32 @@
 # Memory Representations for Robotic Task Planning
 
-**Franka Panda adaptation of PragmaBot — iRobMan Praktikum (Project 2), PEARL Lab, TU Darmstadt**
+**Franka FR3 execution layer for PragmaBot — iRobMan Praktikum (Part II), PEARL Lab, TU Darmstadt**
 
 > Forked from [leggedrobotics/pragmabot](https://github.com/leggedrobotics/pragmabot) · Qu et al., *A Pragmatist Robot: Learning to Plan Tasks by Experiencing the Real World*, IEEE RAL 2026
 
 [![IEEE RAL](https://img.shields.io/badge/IEEE_RAL-2026-blue)](https://ieeexplore.ieee.org/document/11419794)
 [![arXiv](https://img.shields.io/badge/arXiv-2507.16713-b31b1b)](https://arxiv.org/abs/2507.16713)
-[![ROS](https://img.shields.io/badge/ROS-Noetic-blue)](https://wiki.ros.org/noetic)
-[![Python](https://img.shields.io/badge/Python-3.8%2B-green)](https://www.python.org/)
+[![ROS](https://img.shields.io/badge/ROS-2_Humble-blue)](https://docs.ros.org/en/humble/)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-green)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-BSD--3--Clause-orange)](LICENSE)
+
+> **Corrected 2026-09-23:** this file previously described a Franka **Panda**
+> + ROS **Noetic (ROS1)** + TRAC-IK design. That was an earlier plan that was
+> superseded — the actual robot is a **Franka FR3** ("Athna"), the actual
+> stack is **ROS 2 Humble** running host-only (no ROS1, no bridge process),
+> and the current IK solver is `lma_kinematics_plugin`, not TRAC-IK. See the
+> top-level **[`../README.md`](../README.md)** for the accurate architecture,
+> and **[`CLAUDE.md`](CLAUDE.md)** for verified facts and hard rules. This
+> file is kept for the project pitch/citation; don't treat the tables below
+> as current implementation detail.
 
 ---
 
 ## What This Fork Builds
 
-This project adapts the PragmaBot VLM-memory architecture to a **7-DoF Franka Panda** at PEARL Lab. The upstream system provides the full cognitive loop — VLM planning, STM self-reflection, LTM distillation and retrieval — but leaves action execution as a `NotImplementedError`. This fork implements that layer.
+This project adapts the PragmaBot VLM-memory architecture to a **7-DoF Franka FR3** at PEARL Lab. The upstream system provides the full cognitive loop — VLM planning, STM self-reflection, LTM distillation and retrieval — but leaves action execution as a `NotImplementedError`. This fork implements that layer.
 
-**Goal:** An agentic VLM-based planning system where a VLM evaluates each robot action outcome via self-reflection and triggers replanning on failure; outcomes stored in a short-term memory buffer for within-task adaptation. Successful sequences are distilled into long-term memory for retrieval-augmented plan generation, enabling cross-task knowledge reuse on a real Franka Panda.
+**Goal:** An agentic VLM-based planning system where a VLM evaluates each robot action outcome via self-reflection and triggers replanning on failure; outcomes stored in a short-term memory buffer for within-task adaptation. Successful sequences are distilled into long-term memory for retrieval-augmented plan generation, enabling cross-task knowledge reuse on a real Franka FR3.
 
 **Additional investigations (beyond upstream):**
 - Ontology-based experience representations for richer semantic retrieval
@@ -26,16 +36,17 @@ This project adapts the PragmaBot VLM-memory architecture to a **7-DoF Franka Pa
 
 ## What This Fork Adds (Franka Execution Layer)
 
-The upstream pipeline calls `handle_planning_request()` for action execution and raises `NotImplementedError`. This fork implements that integration point for a Franka Panda:
+The upstream pipeline calls `handle_planning_request()` for action execution and raises `NotImplementedError`. This fork implements that integration point for a Franka FR3:
 
 | Component | Implementation |
 |-----------|---------------|
-| Object detection | GroundingDINO (open-vocabulary, text-prompted) |
-| 6D pose estimation | ZED2i RGB-D stereo camera |
-| Motion planning | MoveIt + TRAC-IK on 7-DoF Franka Panda |
-| ROS bridge | Upstream Python nodes wired to ROS topics/services |
+| Object detection | Grounded-SAM-2 (open-vocabulary, text-prompted) |
+| Perception | ZED2 RGB-D stereo camera, fixed off-arm |
+| Grasp synthesis | GraspGen (6-DoF, NVIDIA) |
+| Motion planning | MoveIt 2 (`lma_kinematics_plugin`) on the 7-DoF FR3 |
+| Execution bridge | `pragmabot_bridge`, a native ROS 2 node (see `ros2_ws/src/pragmabot_bridge/`) |
 
-**Status: in progress** — ROS node architecture designed; execution layer implementation ongoing at PEARL Lab.
+**Status: pick + place working reliably on real hardware** (see `ARMIN.md` for the day-by-day log); push implemented; LTM/STM both live.
 
 ---
 
@@ -57,35 +68,12 @@ The upstream system enables robots to learn to plan tasks by experiencing the re
 
 ---
 
-## Prerequisites
+## Prerequisites, installation and usage
 
-- Ubuntu 20.04 with [ROS Noetic](https://wiki.ros.org/noetic/Installation/Ubuntu/)
-- Python 3.8+
-- OpenAI API key (GPT-4o)
-- Franka Panda with ZED2i RGB-D camera *(for execution layer)*
-
-## Installation
-
-```bash
-git clone https://github.com/HarishDeepak/IRM2.git
-cd IRM2
-pip install -r requirements.txt
-```
-
-```bash
-cd <catkin_workspace>
-catkin build pragmabot
-```
-
-```bash
-export OPENAI_API_KEY="your-openai-api-key"
-```
-
-## Usage
-
-```bash
-roslaunch pragmabot launch_pragmabot.launch
-```
+See the top-level **[`../README.md`](../README.md)** — it has the actual,
+verified setup (Ubuntu + ROS 2 Humble, colcon not catkin, `bash setup.sh`,
+per-tool venvs for GraspGen/Grounded-SAM-2) and the `docker compose` /
+`ros2 launch` commands that actually run this system.
 
 ---
 
