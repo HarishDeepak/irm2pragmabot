@@ -1,4 +1,4 @@
-    """Grasp-pose math for pick execution.
+"""Grasp-pose math for pick execution.
 
 Loads a camera-frame grasp pose saved by graspgen_client.py's
 --save_grasps flag, builds a pre-grasp standoff along GraspGen's own
