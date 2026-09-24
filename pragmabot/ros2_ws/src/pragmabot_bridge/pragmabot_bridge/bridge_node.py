@@ -228,6 +228,12 @@ class PragmabotBridge(Node):
         # estimate errs low on single-view clouds.
         self.declare_parameter("gripper_epsilon_inner", 0.008)
         self.declare_parameter("gripper_epsilon_outer", 0.045)
+        # A compressible object (sponge, towel) squeezes far below its
+        # estimated width, which epsilon_inner alone reports as an empty
+        # close. If > 0, any stop with the fingers still at least this far
+        # apart counts as holding something; a true empty close ends near 0.
+        # <= 0 restores the plain epsilon_inner band.
+        self.declare_parameter("gripper_min_held_width", 0.004)
         self.declare_parameter("camera_frame", "zed_left_camera_frame_optical")
         self.declare_parameter("color_topic", "/zed/zed_node/rgb/color/rect/image")
         self.declare_parameter("depth_topic", "/zed/zed_node/depth/depth_registered")
@@ -2553,9 +2559,15 @@ class PragmabotBridge(Node):
         (closing WIDER than commanded just means the object is bigger than
         our estimate, which is the expected direction of the error and
         still a real grasp).
+
+        gripper_min_held_width then widens inner down to a fixed finger gap,
+        so a squeezed sponge counts while a close on air (gap ~0) still fails.
         """
         inner = float(self.get_parameter("gripper_epsilon_inner").value)
         outer = float(self.get_parameter("gripper_epsilon_outer").value)
+        min_held = float(self.get_parameter("gripper_min_held_width").value)
+        if min_held > 0.0 and width - min_held > inner:
+            inner = width - min_held
 
         goal = Grasp.Goal()
         goal.width = width
