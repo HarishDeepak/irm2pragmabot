@@ -378,6 +378,10 @@ class PragmabotBridge(Node):
         # is about whether they can get around the object in the first
         # place, and it is the one that rules out an 88 mm cup.
         self.declare_parameter("max_object_span", 0.075)
+        # max_object_span is measured only over points within this distance
+        # of the grasp across the finger direction (~ the finger pads), so a
+        # curved object's bow does not count. <= 0 = whole cloud (old rule).
+        self.declare_parameter("span_slab_half_width_m", 0.02)
         # Longest side (any axis) the perceived object cloud may have before
         # execute_pick treats it as a contaminated detection - mask bled
         # onto the table, or bad stereo depth on the object - and aborts
@@ -858,6 +862,7 @@ class PragmabotBridge(Node):
             min_width = float(self.get_parameter("min_gripper_width").value)
             max_width = float(self.get_parameter("max_gripper_width").value)
             max_span = float(self.get_parameter("max_object_span").value)
+            span_slab = float(self.get_parameter("span_slab_half_width_m").value)
             if len(ranked) and gripper_width <= 0.0 and object_pcd_file and min_width > 0.0:
                 pcd_cam_probe = np.load(object_pcd_file).astype(np.float64)[:, :3]
                 for rank, cand in enumerate(ranked):
@@ -875,6 +880,15 @@ class PragmabotBridge(Node):
                     # The object's FULL span along the finger axis is what
                     # decides whether the hand can go around it at all.
                     _lx = (pcd_cam_probe - grasps_T_cam[cand][:3, 3]) @ grasps_T_cam[cand][:3, 0]
+                    # Only what lies between the finger pads has to fit
+                    # inside the hand. Measured over the whole cloud, a
+                    # curved object (banana) adds its bow to its thickness
+                    # and every good cross-grasp reads as > 75 mm.
+                    if span_slab > 0.0:
+                        _ly = (pcd_cam_probe - grasps_T_cam[cand][:3, 3]) @ grasps_T_cam[cand][:3, 1]
+                        _lx = _lx[np.abs(_ly) <= span_slab]
+                        if len(_lx) < 10:
+                            continue
                     span = float(_lx.max() - _lx.min())
                     if span > max_span:
                         continue
