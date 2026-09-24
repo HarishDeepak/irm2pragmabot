@@ -48,12 +48,8 @@ Thumbs.db
 *.mov
 *.wmv
 
-# Logs and data (keep directory structure via .gitkeep)
-pragmabot/data/logs/*
-!pragmabot/data/logs/.gitkeep
-
-pragmabot/data/ltm/*
-!pragmabot/data/ltm/ltm.csv
+# Run logs (trial .jsonl + conversation .json) and LTM (ltm.csv + its
+# embeddings) are the experiment record and are tracked.
 
 # Scripts output (keep directory structure via .gitkeep)
 scripts/output/*
