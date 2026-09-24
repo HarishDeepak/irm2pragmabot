@@ -8,7 +8,10 @@ fr3_link0 using the live TF tree.
 GraspGen's grasp-frame convention (grasp_gen/robot.py,
 docs/GRIPPER_DESCRIPTION.md): approach axis is the grasp frame's own
 +Z, finger-closing axis is +X, origin is the gripper base/root link
-(not the fingertip/TCP).
+(not the fingertip/TCP). The FR3 hand closes along its own +Y, so every
+pose sent to MoveIt goes through graspgen_to_hand() first; everything
+that reasons about the finger axis (width, centring, cross-axis ranking)
+stays in GraspGen's convention.
 
 Frame chain resolved by a single lookup_transform call: fr3_link0 ->
 zed_camera_link [easy_handeye2] -> zed_camera_center ->
@@ -44,6 +47,43 @@ def load_all_grasps(npz_path: str) -> np.ndarray:
 def load_grasp(npz_path: str, index: int = 0) -> np.ndarray:
     """Load a single camera-frame grasp pose (see load_all_grasps)."""
     return load_all_grasps(npz_path)[index]
+
+
+def _rot_z(deg: float) -> np.ndarray:
+    c, s = np.cos(np.radians(deg)), np.sin(np.radians(deg))
+    T = np.eye(4)
+    T[:2, :2] = [[c, -s], [s, c]]
+    return T
+
+
+def graspgen_to_hand(grasp_T: np.ndarray, ref_hand_R: np.ndarray = None) -> np.ndarray:
+    """GraspGen grasp pose -> the fr3_hand pose that executes it.
+
+    GraspGen closes the fingers along the grasp frame's X (its franka_panda
+    control points sit at x = +/-0.053), but fr3_hand's finger joints slide
+    along the hand's Y (franka_hand.xacro, finger_joint1 axis 0 1 0).
+    Commanding the GraspGen pose as-is therefore closes the fingers 90 deg
+    away from the grasp that was scored - invisible on a cube, fatal on a
+    banana or sponge. A +/-90 deg turn about the approach axis (Z) maps one
+    onto the other; position and approach direction are unchanged.
+
+    Both turns are the same grasp for the symmetric Franka hand. With
+    `ref_hand_R` (the current hand orientation) the one needing less wrist
+    rotation is returned; otherwise +90.
+    """
+    a = grasp_T @ _rot_z(90.0)
+    if ref_hand_R is None:
+        return a
+    b = grasp_T @ _rot_z(-90.0)
+    # Closer yaw <=> larger trace of R_ref^T R.
+    if np.trace(ref_hand_R.T @ b[:3, :3]) > np.trace(ref_hand_R.T @ a[:3, :3]):
+        return b
+    return a
+
+
+def flip_hand(hand_T: np.ndarray) -> np.ndarray:
+    """The same Franka-hand grasp with the fingers swapped (180 deg about Z)."""
+    return hand_T @ _rot_z(180.0)
 
 
 def select_topdown_index(grasps_T_base: np.ndarray) -> int:

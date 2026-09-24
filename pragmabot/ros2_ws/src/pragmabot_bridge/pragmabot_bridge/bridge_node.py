@@ -978,8 +978,20 @@ class PragmabotBridge(Node):
             )
             return False
 
+        # Everything above ranks grasps in GraspGen's convention (fingers
+        # close along X). From here on poses go to IK/MoveIt for fr3_hand,
+        # whose fingers close along Y - see grasp_transform.graspgen_to_hand.
+        ref_hand_R = None
+        try:
+            _hs = self._tf_buffer.lookup_transform("fr3_link0", eef_link, rclpy.time.Time())
+            ref_hand_R = grasp_transform.transform_to_matrix(_hs)[:3, :3]
+        except Exception:  # noqa: BLE001 - no reference: fixed +90 deg turn
+            pass
+        hands_T_base = np.array([
+            grasp_transform.graspgen_to_hand(g, ref_hand_R) for g in grasps_T_base])
+
         grasp_T_cam = grasps_T_cam[grasp_index]
-        grasp_T_base = grasps_T_base[grasp_index]
+        grasp_T_base = hands_T_base[grasp_index]
         standoff_T_base = grasp_transform.standoff_pose(grasp_T_base, standoff_m)
 
         if gripper_width <= 0.0 and object_pcd_file:
@@ -1096,42 +1108,52 @@ class PragmabotBridge(Node):
                 self._latest_joint_state.name, self._latest_joint_state.position))
             filtered = []
             for cand in attempts:
-                cand_standoff_T = grasp_transform.standoff_pose(
-                    grasps_T_base[int(cand)], standoff_m)
-                ik = self._ik_joint_config(
-                    group_name, eef_link, grasp_transform.matrix_to_pose(cand_standoff_T))
-                if ik is None:
-                    filtered.append(cand)  # couldn't check - don't block on it
-                    continue
-                names, positions = ik
-                cand_by_name = dict(zip(names, positions))
-                common = [n for n in names if n in current_by_name]
-                if common and max_dist > 0.0:
-                    dist = grasp_transform.config_distance(
-                        [cand_by_name[n] for n in common],
-                        [current_by_name[n] for n in common],
-                    )
-                    if dist > max_dist:
-                        self.get_logger().warn(
-                            f"Candidate {cand}: standoff IK needs "
-                            f"{np.degrees(dist):.0f} deg of joint travel "
-                            f"(limit {np.degrees(max_dist):.0f} deg) - "
-                            "skipping to avoid an unnecessarily large "
-                            "joint move"
+                # The Franka hand is symmetric, so the finger-swapped pose
+                # (180 deg about the approach axis) is the same grasp; it is
+                # tried before giving up on a candidate over joint 7.
+                primary = hands_T_base[int(cand)]
+                for variant_n, hand_T in enumerate((primary, grasp_transform.flip_hand(primary))):
+                    tag = f"Candidate {cand}{' (fingers swapped)' if variant_n else ''}"
+                    cand_standoff_T = grasp_transform.standoff_pose(hand_T, standoff_m)
+                    ik = self._ik_joint_config(
+                        group_name, eef_link, grasp_transform.matrix_to_pose(cand_standoff_T))
+                    if ik is None:
+                        if variant_n:
+                            continue
+                        hands_T_base[int(cand)] = hand_T
+                        filtered.append(cand)  # couldn't check - don't block on it
+                        break
+                    names, positions = ik
+                    cand_by_name = dict(zip(names, positions))
+                    common = [n for n in names if n in current_by_name]
+                    if common and max_dist > 0.0:
+                        dist = grasp_transform.config_distance(
+                            [cand_by_name[n] for n in common],
+                            [current_by_name[n] for n in common],
                         )
-                        continue
-                if min_margin > 0.0:
-                    margin, who = grasp_transform.joint_limit_margin(
-                        names, positions, self._limits.bounds())
-                    if who and margin < min_margin:
-                        self.get_logger().warn(
-                            f"Candidate {cand}: standoff IK leaves only "
-                            f"{np.degrees(margin):.1f} deg margin on {who} "
-                            f"(limit {np.degrees(min_margin):.1f} deg) - "
-                            "skipping"
-                        )
-                        continue
-                filtered.append(cand)
+                        if dist > max_dist:
+                            self.get_logger().warn(
+                                f"{tag}: standoff IK needs "
+                                f"{np.degrees(dist):.0f} deg of joint travel "
+                                f"(limit {np.degrees(max_dist):.0f} deg) - "
+                                "skipping to avoid an unnecessarily large "
+                                "joint move"
+                            )
+                            continue
+                    if min_margin > 0.0:
+                        margin, who = grasp_transform.joint_limit_margin(
+                            names, positions, self._limits.bounds())
+                        if who and margin < min_margin:
+                            self.get_logger().warn(
+                                f"{tag}: standoff IK leaves only "
+                                f"{np.degrees(margin):.1f} deg margin on {who} "
+                                f"(limit {np.degrees(min_margin):.1f} deg) - "
+                                "skipping"
+                            )
+                            continue
+                    hands_T_base[int(cand)] = hand_T
+                    filtered.append(cand)
+                    break
             if filtered:
                 if len(filtered) < len(attempts):
                     self.get_logger().info(
@@ -1159,7 +1181,7 @@ class PragmabotBridge(Node):
             # before this loop.
             grasp_index = int(cand)
             grasp_T_cam = grasps_T_cam[grasp_index]
-            grasp_T_base = grasps_T_base[grasp_index]
+            grasp_T_base = hands_T_base[grasp_index]
             standoff_T_base = grasp_transform.standoff_pose(grasp_T_base, standoff_m)
             if attempt_n:
                 self.get_logger().warn(
@@ -1336,13 +1358,12 @@ class PragmabotBridge(Node):
     def _level_place_pose(place_T_base: np.ndarray):
         """A straight-down version of `place_T_base`, keeping its yaw.
 
-        Grasp frame convention (grasp_transform): approach axis is column 2,
-        finger axis is column 0. This rebuilds the rotation with the
-        approach axis pointing straight down (base -Z) and the finger axis
-        set to the horizontal projection of the grasp's finger axis, so the
-        gripper still opens across the object with the least wrist motion.
-        Translation is unchanged. Returns None if the finger axis is almost
-        vertical (no well-defined yaw to keep).
+        `place_T_base` is an fr3_hand pose: approach axis is column 2. This
+        rebuilds the rotation with the approach axis pointing straight down
+        (base -Z) and column 0 set to its own horizontal projection, i.e.
+        the hand's yaw is kept, so the fingers still open across the object
+        with the least wrist motion. Translation is unchanged. Returns None
+        if column 0 is almost vertical (no well-defined yaw to keep).
         """
         R = place_T_base[:3, :3]
         f_horiz = np.array([R[0, 0], R[1, 0], 0.0])
