@@ -125,7 +125,15 @@ class PragmaBot:
 
         self.memory_manager = MemoryManager(self.vlm_client, self.conversation_log)
         self.scene_describer = VLMSceneDescriber(self.vlm_client, self.conversation_log)
-        self.exp_summarizer = VLMExperienceSummarizer(self.vlm_client, self.conversation_log)
+        # Summarizer on its own low-effort client: the LTM save runs after the
+        # task is done, and a slow one was being cut off by Ctrl-C.
+        summarizer_client = self.vlm_client
+        if "claude" in self.config.vlm.vlm_model:
+            summarizer_client = ClaudeVLMClient(self.config.vlm, effort="low")
+        self.exp_summarizer = VLMExperienceSummarizer(summarizer_client, self.conversation_log)
+        # Set while an LTM save is running; main() waits for it on shutdown.
+        self.ltm_save_idle = threading.Event()
+        self.ltm_save_idle.set()
         self.success_detector = VLMSuccessDetector(self.vlm_client, self.conversation_log)
         self.task_planner = VLMTaskPlanner(self.vlm_client, self.conversation_log)
 
@@ -367,10 +375,23 @@ class PragmaBot:
         Args:
             chatbot: Gradio chatbot component (unused, kept for callback API).
         """
-        summarized_experience = self.exp_summarizer.summarize_stm_to_ltm(
-            self.instruction, self.initial_scene_description, self.stm
-        )
-        self.memory_manager.save_experience(self.instruction, self.initial_scene_description, summarized_experience)
+        self.ltm_save_idle.clear()
+        start = time.time()
+        logger.warning("LTM SAVE STARTED - summarizing this run. Do not stop the node until 'LTM SAVED' appears.")
+        try:
+            summarized_experience = self.exp_summarizer.summarize_stm_to_ltm(
+                self.instruction, self.initial_scene_description, self.stm
+            )
+            self.memory_manager.save_experience(
+                self.instruction, self.initial_scene_description, summarized_experience)
+            logger.warning(
+                f"LTM SAVED in {time.time() - start:.0f} s - {self.memory_manager.n_ltm_entries} "
+                f"entries in {self.memory_manager.ltm_path}. Safe to stop the node.")
+        except Exception:
+            logger.error("LTM SAVE FAILED - nothing was written to LTM.", exc_info=True)
+            raise
+        finally:
+            self.ltm_save_idle.set()
 
     def save_conversation_log(self):
         """Save the conversation log to a timestamped JSON file.
@@ -623,6 +644,13 @@ def main(args=None):
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
     finally:
+        if pragmabot is not None and not pragmabot.ltm_save_idle.is_set():
+            logger.warning("LTM save in progress - waiting for it to finish (Ctrl-C again to abandon it)...")
+            try:
+                if not pragmabot.ltm_save_idle.wait(timeout=300):
+                    logger.error("LTM save did not finish within 300 s - exiting without it.")
+            except KeyboardInterrupt:
+                logger.error("LTM save abandoned - nothing was written to LTM.")
         if pragmabot is not None:
             logger.info("Saving conversation log before shutdown...")
             pragmabot.save_conversation_log()

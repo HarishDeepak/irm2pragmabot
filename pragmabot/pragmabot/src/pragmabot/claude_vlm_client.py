@@ -60,10 +60,13 @@ def _to_anthropic(messages):
 class ClaudeVLMClient:
     """VLM client wrapping Anthropic Claude API with sentence-transformers embeddings."""
 
-    def __init__(self, config: DictConfig) -> None:
+    def __init__(self, config: DictConfig, effort: Optional[str] = None) -> None:
         self.config = config
         self.client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         self._embedder = None
+        # None = API default (high). The node gives the experience summarizer
+        # its own client at "low" so the LTM save finishes quickly.
+        self.effort = effort
 
     def _get_embedder(self):
         if self._embedder is None:
@@ -79,11 +82,13 @@ class ClaudeVLMClient:
         system_prompt, anthropic_messages = _to_anthropic(builder.messages)
 
         start_time = time.time()
+        extra = {"output_config": {"effort": self.effort}} if self.effort else {}
         response = self.client.messages.parse(
             model=self.config.vlm_model,
             system=system_prompt,
             messages=anthropic_messages,
             output_format=response_format,
+            **extra,
             thinking={"type": "adaptive"},
             # Thinking tokens count against max_tokens; at 4096 a long
             # post-failure reflection cut the JSON answer off mid-string.
