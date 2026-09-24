@@ -10,8 +10,8 @@ max_steps: 10
 
 # --- Memory Settings ---
 activate_stm: true
-activate_ltm: false
-save_to_ltm: false
+activate_ltm: true
+save_to_ltm: true
 use_random_retrieval: false
 retrieval_top_k: 5  # -1 for everything (unsorted)
 
