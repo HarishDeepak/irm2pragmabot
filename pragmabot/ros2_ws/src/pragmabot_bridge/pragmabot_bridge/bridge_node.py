@@ -169,6 +169,11 @@ class PragmabotBridge(Node):
         # is "the pose we picked from, moved to the new location". Set by
         # execute_pick(), consumed by execute_place().
         self._last_grasp_T_base = None
+        # The held object's points in the fr3_hand frame at the moment of the
+        # grasp (visible surface + its footprint dropped to the table), so a
+        # push with it as the tool knows where its lowest point and leading
+        # face are for any hand orientation. Set/cleared with the grasp pose.
+        self._held_cloud_hand = None
 
         # How many obstacle objects have been placed into the clearing zone
         # so far this session. Used to fan successive obstacles out across
@@ -549,6 +554,11 @@ class PragmabotBridge(Node):
         # Finger gap while pushing. Not fully closed (0.0) - commanding the
         # fingers into each other can stall the Move and fault the hand.
         self.declare_parameter("push_gripper_width", 0.005)
+        # Pushing WITH a held object (e.g. a sponge): height of that object's
+        # lowest point above table_z during the shove. Small, so it reaches
+        # flat objects the fingertips (push_height_min_m) sail over; not
+        # zero, so calibration error does not grind the tool into the table.
+        self.declare_parameter("tool_push_clearance_m", 0.004)
 
         self.get_logger().info(
             "pragmabot_bridge started - waiting for /move_action, "
@@ -1279,6 +1289,8 @@ class PragmabotBridge(Node):
         # Remember where this object was grasped, so a follow-up place goal
         # can descend to the same pose translated to the drop location.
         self._last_grasp_T_base = grasp_T_base.copy()
+        self._held_cloud_hand = self._held_geometry_in_hand(
+            object_pcd_file, T_base_from_cam, grasp_T_base)
 
         if place_after_s > 0.0:
             self.get_logger().info(f"Waiting {place_after_s:.1f}s before placing back down")
@@ -1517,6 +1529,7 @@ class PragmabotBridge(Node):
 
         # Held object is gone; a further place has nothing to place.
         self._last_grasp_T_base = None
+        self._held_cloud_hand = None
         if used_clearing_zone:
             self._cleared_count += 1
         self.get_logger().info("Place sequence complete")
@@ -1567,8 +1580,15 @@ class PragmabotBridge(Node):
         gripper_speed: float = 0.05,
         camera_frame: str = "zed_left_camera_frame_optical",
         home_gripper_first: bool = True,
+        with_held_object: bool = False,
     ) -> tuple[bool, str]:
         """Shove `target_object` `push_direction` ("left"/"right") along the table.
+
+        `with_held_object`: the hand still holds the last picked object; push
+        with it as the tool. The grip is kept (no homing, no closing), and the
+        contact height and start point come from the held object's recorded
+        geometry, so its lowest point runs tool_push_clearance_m above the
+        table instead of the fingertips' push_height_min_m.
 
         A non-prehensile skill: no grasp, so none of the tilt/width/
         confidence gates apply and it works on objects a two-finger hand
@@ -1597,14 +1617,23 @@ class PragmabotBridge(Node):
 
         self._add_table_collision()
 
-        if home_gripper_first and not self._home_gripper():
-            return False, ("push aborted: gripper homing failed - check Desk "
-                           "shows the end effector connected before retrying")
-        # A near-closed hand is the pushing tool. Move, not Grasp - no
-        # contact force wanted while closing in free space.
-        push_w = float(self.get_parameter("push_gripper_width").value)
-        if not self._open_gripper(push_w, gripper_speed):
-            return False, "push aborted: could not close the gripper for pushing"
+        tool_hand = None
+        if with_held_object:
+            tool_hand = self._held_cloud_hand
+            if self._last_grasp_T_base is None or tool_hand is None:
+                return False, (
+                    "push aborted: the hand is holding an object whose shape was not "
+                    "recorded at pick time, so it cannot be used to push safely - "
+                    "PLACE it first")
+        else:
+            if home_gripper_first and not self._home_gripper():
+                return False, ("push aborted: gripper homing failed - check Desk "
+                               "shows the end effector connected before retrying")
+            # A near-closed hand is the pushing tool. Move, not Grasp - no
+            # contact force wanted while closing in free space.
+            push_w = float(self.get_parameter("push_gripper_width").value)
+            if not self._open_gripper(push_w, gripper_speed):
+                return False, "push aborted: could not close the gripper for pushing"
 
         # --- perceive the object ------------------------------------------
         if not self.get_parameter("use_live_perception").value or self._scene_source is None:
@@ -1668,13 +1697,7 @@ class PragmabotBridge(Node):
         distance = float(self.get_parameter("push_distance_m").value)
 
         table_z = float(self.get_parameter("table_z").value)
-        obj_height = obj_top_z - table_z
-        frac = float(self.get_parameter("push_height_frac").value)
-        tip_z = table_z + float(np.clip(
-            frac * obj_height,
-            float(self.get_parameter("push_height_min_m").value),
-            float(self.get_parameter("push_height_max_m").value)))
-        hand_z = tip_z + float(self.get_parameter("push_fingertip_offset_m").value)
+        fingertip_offset = float(self.get_parameter("push_fingertip_offset_m").value)
 
         # Gripper pointed straight down, finger axis perpendicular to the
         # push so the broad side of the closed hand leads.
@@ -1684,8 +1707,36 @@ class PragmabotBridge(Node):
         y_axis = np.cross(z_axis, x_axis)
         R = np.column_stack([x_axis, y_axis, z_axis])
 
-        start_xy = centroid - dir_base * (half_extent + margin)
-        end_xy = centroid + dir_base * distance
+        if tool_hand is None:
+            obj_height = obj_top_z - table_z
+            frac = float(self.get_parameter("push_height_frac").value)
+            tip_z = table_z + float(np.clip(
+                frac * obj_height,
+                float(self.get_parameter("push_height_min_m").value),
+                float(self.get_parameter("push_height_max_m").value)))
+            hand_z = tip_z + fingertip_offset
+            start_xy = centroid - dir_base * (half_extent + margin)
+            end_xy = centroid + dir_base * distance
+            contact_desc = f"contacting at fingertip z={tip_z:.3f} m"
+        else:
+            # Held object's points relative to the hand origin, in base axes,
+            # with the hand in the push orientation R.
+            tool_off = (R @ tool_hand.T).T
+            clearance = float(self.get_parameter("tool_push_clearance_m").value)
+            tip_z = table_z + clearance
+            # Never lower the fingertips below the tool's own clearance.
+            hand_z = max(tip_z - float(tool_off[:, 2].min()), tip_z + fingertip_offset)
+            lead = float((tool_off @ dir_base).max())
+            lateral = tool_off @ x_axis
+            lateral_mid = 0.5 * float(lateral.max() + lateral.min())
+            # Tool's leading face starts `margin` behind the object's near
+            # side, centred on the object across the push; travel is the
+            # same as a bare-hand push.
+            start_xy = (centroid - dir_base * (half_extent + margin + lead)
+                        - x_axis * lateral_mid)
+            end_xy = start_xy + dir_base * (half_extent + margin + distance)
+            contact_desc = (f"pushing with the held object, its lowest point at "
+                            f"z={tip_z:.3f} m")
 
         contact_T = np.eye(4)
         contact_T[:3, :3] = R
@@ -1699,7 +1750,7 @@ class PragmabotBridge(Node):
 
         note = (f"push {target_object!r} {direction}: object centroid "
                 f"[{centroid[0]:.3f}, {centroid[1]:.3f}, {centroid[2]:.3f}] m, "
-                f"contacting at fingertip z={tip_z:.3f} m, shoving "
+                f"{contact_desc}, shoving "
                 f"{distance * 100:.0f} cm along "
                 f"[{dir_base[0]:.2f}, {dir_base[1]:.2f}]")
         self.get_logger().info(note)
@@ -2008,6 +2059,31 @@ class PragmabotBridge(Node):
         return hold, (f"the gripper held the object {hold * 100:.1f} cm above "
                       "its lowest visible point")
 
+    def _held_geometry_in_hand(self, object_pcd_file: str, T_base_from_cam: np.ndarray,
+                               grasp_T_base: np.ndarray):
+        """The just-grasped object's points in the fr3_hand frame, or None.
+
+        The camera sees mostly the top and one side, so the visible cloud's
+        lowest point is above the real bottom. The object was resting on the
+        table when grasped, so its footprint is also added at table_z. If it
+        was actually stacked, that makes the tool look longer than it is, and
+        a tool push then runs higher, not into the table.
+        """
+        if not object_pcd_file or not Path(object_pcd_file).is_file():
+            self.get_logger().warn("held-object geometry not recorded: no object cloud")
+            return None
+        try:
+            cloud_cam = np.load(object_pcd_file).astype(np.float64)[:, :3]
+            cloud_base = (T_base_from_cam[:3, :3] @ cloud_cam.T).T + T_base_from_cam[:3, 3]
+            footprint = cloud_base.copy()
+            footprint[:, 2] = float(self.get_parameter("table_z").value)
+            pts = np.vstack([cloud_base, footprint])
+            inv = np.linalg.inv(grasp_T_base)
+            return (inv[:3, :3] @ pts.T).T + inv[:3, 3]
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f"held-object geometry not recorded: {exc}")
+            return None
+
     def _live_cloud_path(self) -> str:
         """Cloud from the most recent live detection, else the parameter.
 
@@ -2119,6 +2195,7 @@ class PragmabotBridge(Node):
                     gripper_speed=self.get_parameter("gripper_speed").value,
                     camera_frame=self.get_parameter("camera_frame").value,
                     home_gripper_first=self.get_parameter("home_gripper_first").value,
+                    with_held_object=bool(request.push_with_held_object),
                 )
                 result.success = ok
                 result.message = message
@@ -2576,6 +2653,9 @@ class PragmabotBridge(Node):
         return True
 
     def _home_gripper(self) -> bool:
+        # Homing fully opens the hand, so whatever it held is no longer held.
+        self._last_grasp_T_base = None
+        self._held_cloud_hand = None
         result = self._send_goal_blocking(self._homing_client, Homing.Goal(), "Homing")
         if result is None:
             return False

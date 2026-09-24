@@ -73,7 +73,8 @@ class PandaSkillExecutor:
         self._client = ActionClient(node, ExecuteSkill, "/pragmabot/execute_skill")
 
         # Gripper-occupancy latch. Set True after a successful `pick`, back
-        # to False after a successful `place`. Used to hard-reject a second
+        # to False after a successful `place`. Tells the bridge a `push` is a
+        # push-with-held-tool, and hard-rejects a second
         # `pick` while the hand is still holding something - without this,
         # the planner's "pick the target" step after an unstack executes a
         # real pick, whose gripper-open drops the object still in hand
@@ -168,24 +169,28 @@ class PandaSkillExecutor:
 
         # Hard occupancy guard. If the last successful action was a `pick`
         # with no `place` since, the hand is still holding that object -
-        # executing another `pick` (or `push`) would open the gripper and
-        # drop it. Refuse before moving the robot and tell the planner to
-        # place first. This is the deterministic backstop for the LTM
-        # note's "place the removed object before picking the target".
-        if skill in ("pick", "push") and self._holding:
+        # executing another `pick` would open the gripper and drop it.
+        # Refuse before moving the robot and tell the planner to place
+        # first. This is the deterministic backstop for the LTM note's
+        # "place the removed object before picking the target".
+        # A `push` while holding is allowed: the bridge pushes with the held
+        # object as the tool (the paper's pick-sponge-then-push behaviour).
+        if skill == "pick" and self._holding:
             return _result(
                 False,
-                f"gripper is already holding an object from the previous pick - cannot {skill}. "
+                "gripper is already holding an object from the previous pick - cannot pick. "
                 "PLACE the held object first, onto a real container that is NOT the final "
                 "destination (a spare bowl or the tray), then continue.",
             )
+        goal.push_with_held_object = skill == "push" and self._holding
 
         logger.info(
-            "Sending %s goal: target=%r placement=%r push_dir=%r",
+            "Sending %s goal: target=%r placement=%r push_dir=%r with_held=%s",
             skill,
             goal.target_object,
             goal.placement_object,
             goal.push_direction,
+            goal.push_with_held_object,
         )
         result = self._send_and_wait(goal, skill)
 

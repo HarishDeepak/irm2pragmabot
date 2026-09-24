@@ -22,6 +22,10 @@ string placement_object                 # "" unless chosen_skill == "place"
 string push_direction                   # "" unless chosen_skill == "push"; "left" | "right"
 bool should_grasp_at_specific_section   # false unless chosen_skill == "pick"
 bool should_place_at_specific_section   # false unless chosen_skill == "place"
+# Set by the executor, not the planner: true when a push is issued while the
+# hand still holds the object from the last pick. The bridge then pushes with
+# that object as the tool instead of homing (= opening) the gripper.
+bool push_with_held_object
 ---
 # --- Result ---
 bool success
