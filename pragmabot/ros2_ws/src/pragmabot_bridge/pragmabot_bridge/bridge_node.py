@@ -329,7 +329,7 @@ class PragmabotBridge(Node):
         # grasps for the wooden cubes sit at ~22-28 deg off vertical; at
         # 20 deg they were all excluded and only weak near-vertical ones
         # remained. 30 deg still keeps the approach clearly top-down.
-        self.declare_parameter("max_grasp_tilt_deg", 30.0)
+        self.declare_parameter("max_grasp_tilt_deg", 12.0)
         # Keep only the top-K GraspGen candidates by confidence before the
         # tilt gate/selection ever sees them. 0 = no cap (~100 candidates,
         # as GraspGen returns by default) - DEFAULT, after 2026-08-24
