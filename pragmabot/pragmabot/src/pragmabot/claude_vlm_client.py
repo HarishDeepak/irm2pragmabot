@@ -85,7 +85,9 @@ class ClaudeVLMClient:
             messages=anthropic_messages,
             output_format=response_format,
             thinking={"type": "adaptive"},
-            max_tokens=4096,
+            # Thinking tokens count against max_tokens; at 4096 a long
+            # post-failure reflection cut the JSON answer off mid-string.
+            max_tokens=16000,
         )
         elapsed = time.time() - start_time
 
