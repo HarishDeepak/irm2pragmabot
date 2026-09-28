@@ -1,17 +1,6 @@
 # IRM2 — PragmaBot on a Franka FR3
 
-**Reproducing and extending PragmaBot with real robot execution.**
 
-[![Base paper](https://img.shields.io/badge/Base_paper-IEEE_RAL_2026-blue)](https://ieeexplore.ieee.org/document/11419794)
-[![arXiv](https://img.shields.io/badge/arXiv-2507.16713-b31b1b)](https://arxiv.org/abs/2507.16713)
-[![ROS 2](https://img.shields.io/badge/ROS_2-Humble-blue)](https://docs.ros.org/en/humble/)
-[![License](https://img.shields.io/badge/License-BSD--3--Clause-orange)](pragmabot/LICENSE)
-
-<p align="center">
-  <img src="pragmabot/docs/teaser.gif" alt="PragmaBot teaser" width="90%" style="max-width:720px;" />
-  <br/>
-  <em>PragmaBot: a robot completing a task guided by a long-term memory of self-reflective experiences.</em>
-</p>
 
 TU Darmstadt · PEARL Lab · *Praktikum zur intelligenten Robotermanipulation (Part II)* · Project 3, *Memory representations for Robotic Task Planning*.
 
